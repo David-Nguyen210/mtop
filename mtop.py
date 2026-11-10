@@ -457,7 +457,7 @@ class SMC:
     READ_BYTES, READ_INDEX, READ_KEYINFO = 5, 8, 9
     FLT = int.from_bytes(b"flt ", "big")          # Apple Silicon sensors
     SP78 = int.from_bytes(b"sp78", "big")         # Intel sensors
-    CPU_KEYS, GPU_KEYS = ("Tp", "Te", "Tf", "TC"), ("Tg", "TG")
+    PREFIXES = ("Tp", "Te", "Tf", "Tg", "TC", "TG")
 
     def __init__(self):
         io = ctypes.cdll.LoadLibrary(ctypes.util.find_library("IOKit"))
@@ -507,13 +507,13 @@ class SMC:
     def _discover(self):
         count_b = self._read(int.from_bytes(b"#KEY", "big"), 4)
         count = int.from_bytes(count_b, "big") if count_b else 0
-        cpu, gpu = [], []
+        found = {p: [] for p in self.PREFIXES}
         for i in range(count):
             o = self._call(self._KeyData(data8=self.READ_INDEX, data32=i))
             if not o:
                 continue
             name = o.key.to_bytes(4, "big").decode("latin1")
-            if name[:2] not in self.CPU_KEYS + self.GPU_KEYS:
+            if name[:2] not in found:
                 continue
             size, typ = self._info(o.key)
             if (typ, size) not in ((self.FLT, 4), (self.SP78, 2)):
@@ -521,7 +521,13 @@ class SMC:
             v = self._temp(o.key, typ)
             if v is None or not 5 < v < 130:
                 continue
-            (gpu if name[:2] in self.GPU_KEYS else cpu).append((o.key, typ))
+            # M3-family chips name their GPU sensors Tf1x / Tf2x instead of Tg..
+            is_gpu = name[:2] == "Tf" and name[2] in "12"
+            found["Tg" if is_gpu else name[:2]].append((o.key, typ))
+        cpu = found["Tp"] + found["Te"] + found["Tf"]
+        gpu = found["Tg"]
+        if not cpu:                               # Intel names: TC.. for the CPU, TG.. for the GPU
+            cpu, gpu = found["TC"], gpu or found["TG"]
         return cpu, gpu
 
     def read(self):
@@ -618,6 +624,8 @@ class Temps:
                 pass
         if not cpu:
             cpu = [v for k, v in hid.items() if "tdie" in k.lower()]
+        if not gpu:
+            gpu = [v for k, v in hid.items() if "gpu" in k.lower()]
         ssd = [v for k, v in hid.items() if "nand" in k.lower()]
         avg = lambda xs: sum(xs) / len(xs) if xs else None
         return {"cpu": avg(cpu), "cpu_max": max(cpu) if cpu else None, "gpu": avg(gpu),
@@ -976,7 +984,9 @@ def render(st, s, mem, pressure, temps, dsk, bat, info, cols, rows):
     for label, key, hist, col in (("CPU", "cpu", "t_cpu", P_P), ("GPU", "gpu", "t_gpu", P_GPU)):
         v = temps.get(key)
         if v is None:
-            tl += [BOLD + rgb(P_MUTED) + "%-6s" % label + RESET + " " + dim("sensor not available")] + [""] * h
+            why = "no separate sensor: it shares the CPU's chip" if key == "gpu" and temps.get("cpu") is not None \
+                else "sensor not available"
+            tl += [BOLD + rgb(P_MUTED) + "%-6s" % label + RESET + " " + dim(why)] + [""] * h
         else:
             tl.append(gauge(label, v / 105.0, col, BOLD + rgb(temp_rgb(v)) + "%3d°C" % v,
                             "max %d°C" % temps[key + "_max"], bw, G_TEMP))
