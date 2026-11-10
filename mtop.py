@@ -309,11 +309,23 @@ def sh(cmd, timeout=5):
 
 
 def chip_info():
-    name = sh(["sysctl", "-n", "machdep.cpu.brand_string"]) or "Apple Silicon"
+    """(chip name, core summary), both read from this Mac. Nothing is assumed."""
+    name = sh(["sysctl", "-n", "machdep.cpu.brand_string"]) or "Mac"
     p = sh(["sysctl", "-n", "hw.perflevel0.logicalcpu"])
     e = sh(["sysctl", "-n", "hw.perflevel1.logicalcpu"])
-    m = re.search(r"Total Number of Cores:\s*(\d+)", sh(["system_profiler", "SPDisplaysDataType"], 15))
-    parts = [x for x in (e and e + "E", p and p + "P", m and m.group(1) + " GPU") if x]
+    displays = sh(["system_profiler", "SPDisplaysDataType"], 15)
+    m = re.search(r"Total Number of Cores:\s*(\d+)", displays)
+    if e and p:                                   # Apple Silicon: efficiency + performance cores
+        parts = [e + "E", p + "P"]
+    else:                                         # Intel, or a chip with one kind of core
+        n = p or sh(["sysctl", "-n", "hw.physicalcpu"]) or sh(["sysctl", "-n", "hw.logicalcpu"])
+        parts = [n + " cores"] if n else []
+    if m:
+        parts.append(m.group(1) + " GPU")
+    else:                                         # Intel: no GPU core count, show the graphics chip's name
+        models = [g.strip() for g in re.findall(r"Chipset Model:\s*(.+)", displays)]
+        if models:
+            parts.append(models[-1])
     return name, " + ".join(parts)
 
 
@@ -1239,7 +1251,7 @@ def main():
     st = State()
     demo = Demo() if a.demo else None
     local = None if a.demo else LocalStats()
-    chip, cores = ("Apple M4 Pro", "4E + 8P + 16 GPU") if a.demo else chip_info()
+    chip, cores = ("Demo Mac", "fake data, not this computer") if a.demo else chip_info()
     temps_src = None if a.demo else Temps()
     src = None
     if not a.demo and not basic:
