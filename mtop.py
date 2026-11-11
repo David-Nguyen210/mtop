@@ -662,6 +662,7 @@ class LocalStats:
             pass
         self.ticks = None
         self.counters = None
+        self.gpu_mem = None
         self.cpu()
 
     def cpu(self):
@@ -684,7 +685,11 @@ class LocalStats:
         return out
 
     def gpu(self):
-        vals = re.findall(r'"Device Utilization %"=(\d+)', sh(["ioreg", "-r", "-d", "1", "-c", "IOAccelerator"]))
+        """GPU load (0..1). Also records the memory the GPU is using, in GB, as self.gpu_mem."""
+        out = sh(["ioreg", "-r", "-d", "1", "-w0", "-c", "IOAccelerator"])
+        mem = [int(v) for v in re.findall(r'"In use system memory"=(\d+)', out)]
+        self.gpu_mem = sum(mem) / 1024.0 ** 3 if mem else None
+        vals = re.findall(r'"Device Utilization %"=(\d+)', out)
         return min(1.0, max(int(v) for v in vals) / 100.0) if vals else 0.0
 
     def io(self):
@@ -710,7 +715,7 @@ class LocalStats:
         cores = self.cpu()
         rd, wr, n_in, n_out = self.io()
         return {"e_cores": cores[:self.n_e], "p_cores": cores[self.n_e:], "e_mhz": 0, "p_mhz": 0,
-                "gpu": self.gpu(), "gpu_mhz": 0, "cpu_w": 0.0, "gpu_w": 0.0, "ane_w": 0.0, "total_w": 0.0,
+                "gpu": self.gpu(), "gpu_mem": self.gpu_mem, "gpu_mhz": 0, "cpu_w": 0.0, "gpu_w": 0.0, "ane_w": 0.0, "total_w": 0.0,
                 "thermal": None, "has_power": False,
                 "disk_r": rd, "disk_w": wr, "net_in": n_in, "net_out": n_out}
 
@@ -748,7 +753,9 @@ class PowerMetrics:
         proc = d.get("processor", {})
         e_cores, p_cores, e_f, p_f = [], [], [], []
         for cl in proc.get("clusters", []):
-            cores = [1.0 - float(c.get("idle_ratio", 1.0)) for c in cl.get("cpus", [])]
+            # a core is busy only when it is neither idle nor powered down
+            cores = [min(1.0, max(0.0, 1.0 - float(c.get("idle_ratio", 1.0)) - float(c.get("down_ratio", 0.0))))
+                     for c in cl.get("cpus", [])]
             is_e = cl.get("name", "").upper().startswith("E")
             (e_cores if is_e else p_cores).extend(cores)
             (e_f if is_e else p_f).append(cl.get("freq_hz", 0) / 1e6)
@@ -801,7 +808,7 @@ class Demo:
         g = self.wave(0.2, 0.4, 0.4)
         cpu_w, gpu_w = 2 + 28 * sum(p) / 8, 25 * g
         ane_w = 1.5 * self.wave(0.15, 0.2, 0.3)
-        return {"e_cores": e, "p_cores": p, "e_mhz": 1733, "p_mhz": 3912, "gpu": g, "gpu_mhz": 1617,
+        return {"e_cores": e, "p_cores": p, "e_mhz": 1733, "p_mhz": 3912, "gpu": g, "gpu_mem": 0.6 + 2.4 * g, "gpu_mhz": 1617,
                 "cpu_w": cpu_w, "gpu_w": gpu_w, "ane_w": ane_w, "total_w": cpu_w + gpu_w + ane_w,
                 "thermal": "Nominal",
                 "disk_r": 4e6 * self.wave(0.4, 0.3, 0.3), "disk_w": 1e6 * self.wave(0.6, 0.3, 0.3),
@@ -832,6 +839,7 @@ class State:
         self.purge_before = 0.0
         self.msg = ""
         self.sel = 0
+        self.sel_pid = None
         self.rows = 8
         self.sort = "cpu"
         self.confirm = None
@@ -964,7 +972,8 @@ def render(st, s, mem, pressure, temps, dsk, bat, info, cols, rows):
     p_col = GOOD if pressure == "normal" else WARN if pressure == "warning" else BAD
     gm = [gauge("GPU", s["gpu"], P_GPU, pct(s["gpu"]), "%4d MHz" % s["gpu_mhz"] if s["gpu_mhz"] else "", bw, G_GPU)]
     gm += graph_rows(st.h["gpu"], gw, h, 1.0, G_GPU, hi="100%", lo="0%" if h > 1 else "")
-    gm.append("")
+    gm.append(dim("%6s " % "VRAM") + TEXT + "%.1f GB" % s["gpu_mem"] + RESET + muted(" in use, shared with RAM")
+              if s.get("gpu_mem") is not None else "")
     gm.append(BOLD + rgb(P_RAM) + "%-6s" % "RAM" + RESET + " "
               + stacked([(app, SEG_APP), (wired, SEG_WIRED), (comp, SEG_COMP), (cache_seg, SEG_CACHE)], total, bw)
               + " " + pct(ram_f) + " " + muted("%.1f/%.0f GB" % (used, total)))
@@ -1067,7 +1076,11 @@ def render(st, s, mem, pressure, temps, dsk, bat, info, cols, rows):
     name_w = max(6, inner - 29)
     st.rows = body_lines - 1
     procs = st.sorted_procs()
+    pids = [r[0] for r in procs]
+    if st.sel_pid in pids:                        # keep the same app selected when the list reorders
+        st.sel = pids.index(st.sel_pid)
     st.sel = min(st.sel, max(0, len(procs) - 1))
+    st.sel_pid = pids[st.sel] if pids else None
     arrow = lambda k: "▾" if st.sort == k else " "
     pl = [muted(" %6s %5s%s%5s %7s%s %s" % ("PID", "CPU%", arrow("cpu"), "", "RAM", arrow("mem"), "APP"))]
     for i, (pid, user, cpu_p, rss, name) in enumerate(procs):
@@ -1148,10 +1161,11 @@ def act(action, st, demo):
     if action in ("up", "down"):
         st.sel = max(0, min(len(procs) - 1, st.sel + (1 if action == "down" else -1)))
         if procs:
+            st.sel_pid = procs[st.sel][0]
             st.msg = "selected %s (pid %d)" % (procs[st.sel][4], procs[st.sel][0])
     elif action == "s":
         st.sort = "mem" if st.sort == "cpu" else "cpu"
-        st.sel = 0
+        st.sel, st.sel_pid = 0, None
         st.msg = "sorted by %s" % ("CPU" if st.sort == "cpu" else "RAM")
     elif action == "k":
         if not procs:
@@ -1187,6 +1201,7 @@ def click(x, y, st, demo):
     if not st.confirm and count and first <= y < first + count and x0 <= x <= x1:
         st.sel = y - first
         p = st.sorted_procs()[st.sel]
+        st.sel_pid = p[0]
         st.msg = "selected %s (pid %d)" % (p[4], p[0])
     return True
 
@@ -1318,8 +1333,10 @@ def main():
                 if s:
                     if not s["e_cores"] and not s["p_cores"]:      # Intel: no per-core load in powermetrics
                         s["p_cores"] = local.cpu()
+                    load = local.gpu()                             # also measures GPU memory
                     if s["gpu"] is None:
-                        s["gpu"] = local.gpu()
+                        s["gpu"] = load
+                    s["gpu_mem"] = local.gpu_mem
             elif time.time() >= next_tick:
                 next_tick = time.time() + a.interval
                 s = demo.sample() if a.demo else local.sample()
