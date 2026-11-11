@@ -32,6 +32,15 @@ mtop is already on your Mac. Open Terminal and paste:
 python3 ~/mtop.py
 ```
 
+## Get the latest version
+
+mtop does not update by itself. To get new features and fixes, paste the line
+from Step 2 again. It replaces your old copy with the newest one:
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/David-Nguyen210/mtop/main/mtop.py -o ~/mtop.py && python3 ~/mtop.py
+```
+
 ## Don't want to type a password?
 
 Use basic mode. It shows everything except watts and clock speed:
