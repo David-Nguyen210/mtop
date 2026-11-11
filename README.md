@@ -76,6 +76,31 @@ happens once on Macs that have never used Python.
 Any Mac with an Apple chip (M1 or newer). Intel Macs should work too, but are
 less tested.
 
+**What is the RAM cache, and do I need to clear it?**
+When you open an app or a file, macOS keeps a copy in spare memory so it
+loads faster next time. That copy is the cache. You almost never need to
+clear it: macOS gives that memory back to apps the moment they ask for it.
+The `c` key is there for the rare case where you want to see how much memory
+is really free, for example before starting a very large job.
+
+**Why does the cache fill up again after I clear it?**
+Because macOS does it on purpose. Empty memory is wasted memory, so macOS
+uses any spare RAM to keep recently used files ready. A few minutes after
+clearing, it has filled up again. That is normal and healthy, not a leak.
+
+**Does a full cache, or clearing it, affect my laptop?**
+A full cache does not slow your Mac down, use more battery, or wear anything
+out. Clearing it is harmless too, but it does not make your Mac faster. For a
+few minutes afterwards things can even feel slightly slower, because files
+have to be read from the SSD again.
+
+**So how do I know if my Mac is short of memory?**
+Ignore the cache and look at two things in the memory panel. `pressure`
+should say `normal`, and `Swap` should say `inactive` or stay small. If
+pressure says `warning` or `critical`, or swap keeps growing, quit some apps
+from the Top apps list (press `s` to sort by RAM). mtop also tells you in the
+line at the bottom when memory is tight.
+
 **The picture looks squashed.**
 Make the Terminal window bigger. It looks best at 120 x 40 or larger.
 
