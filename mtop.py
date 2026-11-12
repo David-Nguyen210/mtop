@@ -20,6 +20,7 @@ It never writes to hardware.
 import argparse
 import ctypes
 import ctypes.util
+import json
 import math
 import os
 import plistlib
@@ -31,6 +32,7 @@ import signal
 import struct
 import subprocess
 import sys
+import threading
 import time
 from collections import deque
 
@@ -383,21 +385,30 @@ def smart_status():
     return m.group(1).strip() if m else "unknown"
 
 
+def _signed(v):
+    """ioreg prints negative numbers as huge unsigned ones."""
+    return v - 2.0 ** 64 if v is not None and v > 2.0 ** 63 else v
+
+
 def battery():
-    out = sh(["ioreg", "-rn", "AppleSmartBattery"])
+    """Battery state plus the power coming in from the charger. None on a Mac without a battery."""
+    out = sh(["ioreg", "-rn", "AppleSmartBattery", "-w0"])
     if not out:
         return None
 
     def val(key):
-        m = re.search(r'^\s*"%s" = (\S+)' % key, out, re.M)
-        return m.group(1) if m else None
+        m = re.search(r'^[\s|]*"%s" = (.*)$' % key, out, re.M)
+        return m.group(1).strip() if m else None
 
     def num(key):
-        v = val(key)
         try:
-            return float(v)
+            return _signed(float(val(key)))
         except (TypeError, ValueError):
             return None
+
+    def inner(key, text):
+        m = re.search(r'"%s"=(\d+)' % key, text or "")
+        return _signed(float(m.group(1))) if m else None
 
     pct_ = num("CurrentCapacity")
     if pct_ is None:
@@ -405,17 +416,257 @@ def battery():
     mx = num("MaxCapacity") or 100
     if mx > 100:                      # older firmware reports mAh
         pct_ = 100 * pct_ / mx
-    raw, design = num("AppleRawMaxCapacity") or num("NominalChargeCapacity"), num("DesignCapacity")
-    t = num("Temperature")
+    deep = lambda key: num(key) or inner(key, out)      # newer Macs keep these inside "BatteryData"
+    # macOS Settings shows nominal / design capacity; the raw value reads a little lower
+    raw, design = deep("NominalChargeCapacity") or deep("AppleRawMaxCapacity"), deep("DesignCapacity")
+    t = deep("Temperature") or deep("VirtualTemperature")
     plugged = val("ExternalConnected") == "Yes"
     charging = val("IsCharging") == "Yes"
+    full = val("FullyCharged") == "Yes"
+    amps, volts = num("Amperage"), num("Voltage")
+    tele, adapter = val("PowerTelemetryData"), val("AdapterDetails") or ""
+    kilo = lambda v: v / 1000.0 if v is not None else None
+    name = re.search(r'"(?:Name|Description)"="([^"]+)"', adapter)
     return {
         "pct": pct_,
-        "health": 100 * raw / design if raw and design else None,
+        "health": min(100, math.floor(100 * raw / design)) if raw and design else None,   # rounded down, like macOS
         "cycles": int(num("CycleCount") or 0),
         "temp": t / 100 if t else None,
-        "state": "charging" if charging else "plugged in" if plugged else "on battery",
+        "state": "charging" if charging else ("full, plugged in" if full else "plugged in") if plugged else "on battery",
+        "plugged": plugged,
+        # measured by the Mac's own power chip, in watts / volts / amps
+        "in_w": kilo(inner("SystemPowerIn", tele)) if plugged else 0.0,
+        "in_v": kilo(inner("SystemVoltageIn", tele)) if plugged else 0.0,
+        "in_a": kilo(inner("SystemCurrentIn", tele)) if plugged else 0.0,
+        "load_w": kilo(inner("SystemLoad", tele)),
+        "bat_w": amps * volts / 1e6 if amps is not None and volts else None,      # + charging, - draining
+        "adapter_w": inner("Watts", adapter) if plugged else None,
+        "adapter_name": name.group(1) if name and plugged else "",
     }
+
+
+# ============================================================ ports
+def _blocks(text):
+    """Split ioreg output into one chunk of text per registry entry."""
+    return re.split(r"\n(?=[\s|]*\+-o )", text)
+
+
+def _prop(block, key):
+    m = re.search(r'"%s" = (.*)' % re.escape(key), block)
+    return m.group(1).strip() if m else None
+
+
+def read_ports():
+    """Every physical port the Mac reports, with what is active on it right now."""
+    out = sh(["ioreg", "-r", "-c", "IOPort", "-w0", "-l"])
+    ports, charge = {}, {}
+    for b in _blocks(out):
+        desc = _prop(b, "PortDescription")
+        if desc:
+            desc = desc.strip('"')
+            try:
+                num = int(_prop(b, "PortNumber") or 1)
+            except ValueError:
+                num = 1
+            ports[desc] = {
+                "id": desc, "num": num,
+                "kind": (_prop(b, "PortTypeDescription") or desc).strip('"'),
+                "active": _prop(b, "ConnectionActive") == "Yes",
+                "transports": re.findall(r'"(\w+)"', _prop(b, "TransportsActive") or ""),
+                "limits": [int(x) for x in re.findall(r"\d+", _prop(b, "IOAccessoryPowerCurrentLimits") or "")],
+                "charge": None,
+            }
+            continue
+        win = _prop(b, "WinningPowerSourceOption")
+        owner = (_prop(b, "Description") or "").strip('"').split("/")[0]
+        if win and owner:
+            g = lambda k: float((re.search(r'"%s"=(\d+)' % re.escape(k), win) or [0, 0])[1])
+            charge[owner] = {"v": g("Voltage (mV)") / 1000, "a": g("Max Current (mA)") / 1000,
+                             "w": g("Max Power (mW)") / 1000}
+    for owner, c in charge.items():
+        if owner in ports:
+            ports[owner]["charge"] = c
+    return sorted(ports.values(), key=lambda p: (p["kind"], p["num"]))
+
+
+def human_size(b):
+    """Drive sizes the way they are printed on the box: 256 GB, 1 TB."""
+    for unit, div in (("TB", 1e12), ("GB", 1e9), ("MB", 1e6)):
+        if b >= div * 0.95 or unit == "MB":
+            v = b / div
+            return ("%.0f %s" if v >= 9.95 or abs(v - round(v)) < 0.06 else "%.1f %s") % (v, unit)
+
+
+def read_volumes():
+    """{"disk6": [(volume name, used bytes, free bytes)]} for every mounted volume."""
+    out = {}
+    for line in sh(["df", "-k"]).splitlines():
+        m = re.match(r"/dev/(disk\d+)s\d+\s+(\d+)\s+(\d+)\s+(\d+)\s+\S+\s+\S+\s+\S+\s+\S+\s+(/.*)$", line)
+        if m and m.group(5).startswith("/Volumes/"):
+            out.setdefault(m.group(1), []).append(
+                (os.path.basename(m.group(5)), int(m.group(3)) * 1024, int(m.group(4)) * 1024))
+    return out
+
+
+def read_usb():
+    """Everything plugged in over USB, one entry per plug: names, speed, reserved current, drive details."""
+    devs, vols = [], None
+    for tree in re.split(r"\n(?=\+-o )", sh(["ioreg", "-r", "-c", "IOUSBHostDevice", "-w0", "-l"])):
+        blocks = _blocks(tree)
+        top = blocks[0]
+        if not _prop(top, "USB Product Name") or _prop(top, "Built-In") == "Yes":
+            continue
+        names, ma, bps, disk = [], 0, 0, None
+        for b in blocks:
+            if "<class IOUSBHostDevice" in b.split("\n", 1)[0]:
+                n = (_prop(b, "USB Product Name") or "").strip('"')
+                if n and n not in names:
+                    names.append(n)
+                try:
+                    ma += int(_prop(b, "UsbPowerSinkAllocation") or 0)
+                    bps = max(bps, int(_prop(b, "UsbLinkSpeed") or 0))
+                except ValueError:
+                    pass
+            stats = _prop(b, "Statistics")
+            if stats and disk is None and "Bytes (Read)" in stats:
+                g = lambda k: int((re.search(r'"%s"=(\d+)' % re.escape(k), stats) or [0, 0])[1])
+                disk = {"read": g("Bytes (Read)"), "written": g("Bytes (Write)"), "bsd": "", "size": 0, "vols": []}
+            if disk is not None and not disk["bsd"] and _prop(b, "Whole") == "Yes":
+                disk["bsd"] = (_prop(b, "BSD Name") or "").strip('"')
+                try:
+                    disk["size"] = int(_prop(b, "Size") or 0)
+                except ValueError:
+                    pass
+        if disk and disk["bsd"]:
+            if vols is None:
+                vols = read_volumes()
+            disk["vols"] = vols.get(disk["bsd"], [])
+        try:
+            bus = int(_prop(top, "locationID") or -1) >> 24
+        except ValueError:
+            bus = -1
+        speed = "USB 3 · %d Gb/s" % (bps // 10 ** 9) if bps >= 10 ** 9 else "USB 2" if bps >= 4 * 10 ** 8 else \
+            "USB 1" if bps else ""
+        vendor = (_prop(top, "USB Vendor Name") or "").strip('"')
+        real = [n for n in names if "hub" not in n.lower()] or names[:1]
+        if vendor and len(real) == 1 and vendor.lower() not in real[0].lower() and len(vendor) < 12:
+            real = [vendor + " " + real[0]]
+        devs.append({"name": real[0], "names": real, "ma": ma, "speed": speed, "bus": bus, "bps": bps,
+                     "disk": disk, "r": 0.0, "w": 0.0, "peak": 0.0})
+    return devs
+
+
+def read_thunderbolt():
+    """{receptacle number: {"speed": "Up to 120 Gb/s", "devices": [names]}}"""
+    out = {}
+    try:
+        buses = json.loads(sh(["system_profiler", "-json", "SPThunderboltDataType"], 20) or "{}")
+    except ValueError:
+        return out
+
+    def names(items):
+        found = []
+        for it in items or []:
+            n = it.get("device_name_key") or it.get("_name")
+            if n:
+                found.append(((it.get("vendor_name_key") or "") + " " + n).strip())
+            found += names(it.get("_items"))
+        return found
+
+    for bus in buses.get("SPThunderboltDataType", []):
+        tag = bus.get("receptacle_1_tag") or {}
+        try:
+            num = int(tag.get("receptacle_id_key"))
+        except (TypeError, ValueError):
+            continue
+        out[num] = {"speed": tag.get("current_speed_key", ""), "devices": names(bus.get("_items"))}
+    return out
+
+
+def tb_name(speed, chip):
+    """Thunderbolt generation of a port, from the top speed macOS reports for it."""
+    m = re.search(r"(\d+)\s*Gb", speed or "")
+    gb = int(m.group(1)) if m else 0
+    if gb >= 80:
+        return "Thunderbolt 5"
+    if gb >= 40:
+        if "Intel" in chip:
+            return "Thunderbolt 3"
+        mm = re.search(r"\bM(\d+)( Pro| Max| Ultra)?", chip)
+        # same 40 Gb/s speed: Apple calls it Thunderbolt 4 on Pro/Max/Ultra chips and on every M4 or newer
+        if mm and (mm.group(2) or int(mm.group(1)) >= 4):
+            return "Thunderbolt 4"
+        return "Thunderbolt 3 / USB4"
+    return "USB-C"
+
+
+class PortWatch(threading.Thread):
+    """Keeps the list of ports and plugged-in devices fresh without slowing the screen down."""
+
+    def __init__(self):
+        threading.Thread.__init__(self)
+        self.daemon = True
+        self.model, self.ports, self.usb, self.tb = "", [], [], {}
+        self.start()
+
+    def run(self):
+        m = re.search(r"Model Name:\s*(.+)", sh(["system_profiler", "SPHardwareDataType"], 15))
+        self.model = m.group(1).strip() if m else "Mac"
+        seen, tb_at, prev = None, 0.0, {}
+        while True:
+            try:
+                ports, usb = read_ports(), read_usb()
+                t = time.time()
+                for d in usb:                                      # drive read / write speed since last look
+                    old = prev.get(d["name"])
+                    if d["disk"] and old and t > old[0]:
+                        d["r"] = max(0.0, (d["disk"]["read"] - old[1]) / (t - old[0]))
+                        d["w"] = max(0.0, (d["disk"]["written"] - old[2]) / (t - old[0]))
+                    d["peak"] = max(d["r"], d["w"], old[3] if old else 0.0)
+                prev = {d["name"]: (t, d["disk"]["read"], d["disk"]["written"], d["peak"]) for d in usb if d["disk"]}
+                now = tuple((p["id"], p["active"], tuple(p["transports"])) for p in ports)
+                if now != seen or time.time() - tb_at > 30:        # slow call: only when something changed
+                    self.tb, seen, tb_at = read_thunderbolt(), now, time.time()
+                self.ports, self.usb = ports, usb
+            except Exception:
+                pass
+            time.sleep(1.5)
+
+
+class DemoPorts:
+    model = "MacBook Pro"
+    out = {1: (5.12, 0.62)}
+    tb = {1: {"speed": "Up to 120 Gb/s", "devices": []}, 2: {"speed": "Up to 120 Gb/s", "devices": []},
+          3: {"speed": "Up to 120 Gb/s", "devices": []}}
+    usb = [{"name": "Portable SSD", "names": ["Portable SSD"], "ma": 896, "speed": "USB 3 · 10 Gb/s", "bus": 0,
+            "bps": 10 ** 10, "r": 182e6, "w": 0.0, "peak": 940e6,
+            "disk": {"bsd": "disk6", "size": 1e12, "read": 0, "written": 0, "vols": [("Portable SSD", 598e9, 402e9)]}}]
+    ports = [
+        {"id": "m", "num": 1, "kind": "MagSafe 3", "active": True, "transports": ["CC"], "limits": [],
+         "charge": {"v": 20.0, "a": 4.8, "w": 96.0}},
+        {"id": "c1", "num": 1, "kind": "USB-C", "active": True, "transports": ["CC", "USB3"], "limits": [], "charge": None},
+        {"id": "c2", "num": 2, "kind": "USB-C", "active": False, "transports": [], "limits": [], "charge": None},
+        {"id": "c3", "num": 3, "kind": "USB-C", "active": False, "transports": [], "limits": [], "charge": None},
+        {"id": "h", "num": 1, "kind": "HDMI", "active": True, "transports": ["DisplayPort"], "limits": [], "charge": None},
+        {"id": "s", "num": 1, "kind": "SD Card", "active": False, "transports": [], "limits": [], "charge": None},
+    ]
+
+
+def port_layout(model, ports):
+    """(left side, right side). Which side a port sits on comes from the kind of Mac."""
+    by = lambda kind: sorted((p for p in ports if p["kind"].startswith(kind)), key=lambda p: p["num"])
+    mag, usb, hdmi, sd = by("MagSafe"), by("USB-C"), by("HDMI"), by("SD")
+    known = mag + usb + hdmi + sd
+    other = [p for p in ports if p not in known]
+    audio = [{"id": "audio", "num": 1, "kind": "Audio", "active": False, "transports": [], "static": True}]
+    if "Book" not in model:                       # desktop Mac: no left and right, just a list
+        half = (len(usb) + 1) // 2
+        return mag + usb[:half] + other, usb[half:] + hdmi + sd + audio
+    if hdmi:                                      # 14" and 16" MacBook Pro
+        return mag + usb[:2] + audio, hdmi + usb[2:] + sd + other
+    if len(usb) >= 4:                             # older 4-port MacBook Pro
+        return mag + usb[:2] + other, usb[2:] + audio
+    return mag + usb + other, audio               # MacBook Air, 13" MacBook Pro
 
 
 def processes():
@@ -530,6 +781,32 @@ class SMC:
             cpu, gpu = found["TC"], gpu or found["TG"]
         return cpu, gpu
 
+    def port_out(self):
+        """{port number: (volts, amps)} measured on each USB-C port by the Mac's own power sensors."""
+        out = {}
+        for n in range(1, 7):
+            a = self._read(int.from_bytes(("D%dJI" % n).encode(), "big"), 4)
+            v = self._read(int.from_bytes(("D%dJV" % n).encode(), "big"), 4)
+            if a and v:
+                out[n] = (struct.unpack("<f", v)[0], struct.unpack("<f", a)[0])
+        return out
+
+    def fans(self):
+        """Fan speeds in rpm. Empty on a Mac without fans."""
+        n = self._read(int.from_bytes(b"FNum", "big"), 1)
+        out = []
+        for i in range(min(n[0], 8) if n else 0):
+            key = int.from_bytes(("F%dAc" % i).encode(), "big")
+            size, typ = self._info(key)
+            b = self._read(key, size) if size else None
+            if not b:
+                continue
+            if typ == self.FLT and size == 4:
+                out.append(struct.unpack("<f", b)[0])
+            elif size == 2:
+                out.append(int.from_bytes(b, "big") / 4.0)
+        return out
+
     def read(self):
         def vals(keys):
             return [v for v in (self._temp(k, t) for k, t in keys) if v is not None and 5 < v < 130]
@@ -611,10 +888,11 @@ class Temps:
             pass
 
     def read(self):
-        cpu, gpu, hid = [], [], {}
+        cpu, gpu, hid, fans = [], [], {}, []
         if self.smc:
             try:
                 cpu, gpu = self.smc.read()
+                fans = self.smc.fans()
             except Exception:
                 pass
         if self.hid:
@@ -629,7 +907,7 @@ class Temps:
         ssd = [v for k, v in hid.items() if "nand" in k.lower()]
         avg = lambda xs: sum(xs) / len(xs) if xs else None
         return {"cpu": avg(cpu), "cpu_max": max(cpu) if cpu else None, "gpu": avg(gpu),
-                "gpu_max": max(gpu) if gpu else None, "ssd": max(ssd) if ssd else None}
+                "gpu_max": max(gpu) if gpu else None, "ssd": max(ssd) if ssd else None, "fans": fans}
 
 
 # ============================================================ usage without sudo
@@ -816,7 +1094,8 @@ class Demo:
 
     def temps(self):
         c = 45 + 40 * self.wave(0.3, 0.5, 0.35)
-        return {"cpu": c, "cpu_max": c + 6, "gpu": c - 8, "gpu_max": c - 3, "ssd": 38.0}
+        return {"cpu": c, "cpu_max": c + 6, "gpu": c - 8, "gpu_max": c - 3, "ssd": 38.0,
+                "fans": [1200 + 40 * (c - 45)] * 2}
 
     def procs(self):
         user = os.environ.get("USER", "you")
@@ -843,6 +1122,7 @@ class State:
         self.rows = 8
         self.sort = "cpu"
         self.confirm = None
+        self.view = "main"
         self.procs = []
         self.last = None
         self.hot = []           # clickable footer buttons: (x0, x1, action)
@@ -896,6 +1176,305 @@ def health_check(s, mem, pressure, temps, dsk, bat, procs):
     return tips
 
 
+# ============================================================ ports, power & heat view
+class Canvas:
+    """A grid of coloured characters, for drawing the Mac's body."""
+
+    def __init__(self, w, h):
+        self.w, self.h = w, h
+        self.ch = [[" "] * w for _ in range(h)]
+        self.st = [[""] * w for _ in range(h)]
+
+    def put(self, x, y, text, style=""):
+        if 0 <= y < self.h:
+            for i, c in enumerate(text):
+                if 0 <= x + i < self.w:
+                    self.ch[y][x + i], self.st[y][x + i] = c, style
+
+    def lines(self):
+        out = []
+        for chars, styles in zip(self.ch, self.st):
+            row, last = [], None
+            for c, s in zip(chars, styles):
+                if s != last:
+                    row.append(RESET + s)
+                    last = s
+                row.append(c)
+            out.append("".join(row) + RESET)
+        return out
+
+
+PORT_GLYPH = {"USB-C": "(══)", "MagSafe": "[▪▪]", "HDMI": "◥██◤", "SD": "[▭▭]", "Audio": "(◉)"}
+HEAT = [(245, 170, 60), (245, 95, 50), (235, 45, 55)]
+
+
+def usb_by_port(pw):
+    """{port id: [usb devices]}, or None when devices cannot be matched to ports with certainty.
+
+    Apple-chip Macs give every USB-C port its own USB controller, numbered in port order.
+    """
+    usbc = [p for p in pw.ports if p["kind"].startswith("USB-C")]
+    out = {p["id"]: [] for p in usbc}
+    busy = [p for p in usbc if "USB2" in p["transports"] or "USB3" in p["transports"]]
+    if len(busy) == 1:
+        out[busy[0]["id"]] = list(pw.usb)
+        return out
+    for d in pw.usb:
+        hit = [p for p in busy if p["num"] - 1 == d["bus"]]
+        if not hit:
+            return None
+        out[hit[0]["id"]].append(d)
+    return out
+
+
+def port_text(p, pw, bat, chip, sole_charger, devices, out=None):
+    """(name, status lines, flow, colour) for one port. flow: None, "in" (power in) or "both" (a device)."""
+    kind, num = p["kind"], p["num"]
+    if p.get("static"):
+        return "Headphone jack", ["3.5 mm audio"], None, P_DIM
+    if kind.startswith("USB-C"):
+        name = "%s · port %d" % (tb_name((pw.tb.get(num) or {}).get("speed"), chip), num)
+    else:
+        name = "SD card slot" if kind.startswith("SD") else kind
+    lines, flow, col = [], None, P_MUTED
+    c = p.get("charge")
+    if c:
+        flow, col = "in", P_PWR
+        if sole_charger and bat and bat.get("in_w"):
+            lines.append("power in %.1f W" % bat["in_w"])
+            lines.append("%.1f V × %.2f A" % (bat.get("in_v") or 0, bat.get("in_a") or 0))
+        else:
+            lines.append("charger connected")
+        lines.append("charger can give %.0f W" % c["w"])
+    labels = {"CIO": "Thunderbolt device", "USB3": "USB 3 device", "USB2": "USB 2 device",
+              "DisplayPort": "display", "SD": "card inserted"}
+    found = [labels[t] for t in p["transports"] if t in labels]
+    if found:
+        flow = "both"
+        col = P_NET if found == ["display"] else P_UP
+        tb_devs = (pw.tb.get(num) or {}).get("devices", []) if kind.startswith("USB-C") else []
+        named = tb_devs + [n for d in devices for n in d["names"]]
+        lines += named or [" + ".join(found)]
+        for d in devices:
+            k = d.get("disk")
+            if k and k["size"]:
+                free = sum(v[2] for v in k["vols"])
+                lines.append("drive %s" % human_size(k["size"]) + (" · %s free" % human_size(free) if k["vols"] else ""))
+        ma = sum(d["ma"] for d in devices)
+        if kind.startswith("USB-C") and not c:
+            if out:                                   # measured live on this port
+                lines.append("power out %.2f W" % (out[0] * out[1]))
+                lines.append("%.2f V × %.3f A" % out + (" · max %.1f W" % (ma * 5 / 1000.0) if ma else ""))
+            else:
+                lines.append("power in 0 W · out up to %.1f W" % (ma * 5 / 1000.0) if ma else "power in 0 W")
+        for d in devices:
+            if d.get("disk"):
+                lines.append("now R %s · W %s" % (human_rate(d["r"]), human_rate(d["w"])))
+                if d.get("peak", 0) >= 1e6:
+                    lines.append("fastest seen %s" % human_rate(d["peak"]))
+        fastest = max(devices, key=lambda d: d["bps"]) if devices else None
+        if fastest and fastest["speed"]:
+            # what the cable link can carry, after USB's own overhead: a ceiling, not the drive's real speed
+            cap = {20: 2400, 10: 1200, 5: 500}.get(fastest["bps"] // 10 ** 9)
+            if cap and any(d.get("disk") for d in devices):
+                lines.append("cable limit ~%d MB/s" % cap)
+            else:
+                lines.append("link " + fastest["speed"])
+    if not lines:
+        lines.append("plugged in, no data" if p["active"] else "empty")
+        if p["active"]:
+            col = WARN
+    return name, lines, flow, col
+
+
+def mac_view(st, s, temps, bat, info, W, H):
+    """The Mac seen from above: ports on its sides, the chip in the middle, heat leaving the case."""
+    pw = info["ports"]
+    now = time.time()
+    cw = W - 4
+    cv = Canvas(cw, H)
+    model = pw.model or "Mac"
+    left, right = port_layout(model, pw.ports)
+    laptop, fanless = "Book" in model, "Air" in model
+    flow_w = 7 if cw >= 96 else 4
+    bw = max(26, min(64, int(cw * 0.40)))
+    lw = (cw - bw - 2 * flow_w) // 2
+    bx0 = lw + flow_w
+    bx1 = bx0 + bw - 1
+    by0, by1 = 2, H - 3
+    edge = rgb(P_BORDER)
+
+    # ---- the body
+    cv.put(bx0, by0, "╭" + "─" * (bw - 2) + "╮", edge)
+    cv.put(bx0, by1, "╰" + "─" * (bw - 2) + "╯", edge)
+    for y in range(by0 + 1, by1):
+        cv.put(bx0, y, "│", edge)
+        cv.put(bx1, y, "│", edge)
+
+    # ---- the chip
+    t_cpu, t_gpu = temps.get("cpu"), temps.get("gpu")
+    hottest = temps.get("cpu_max") or t_cpu or 40.0
+    heat = min(1.0, max(0.0, (hottest - 35) / 60.0))
+    hot = grad(HEAT, heat)
+    cwid = min(bw - 4, 30)
+    cx0 = bx0 + (bw - cwid) // 2
+    cy0 = by0 + 3
+    chip_edge = rgb(grad([hot, (255, 255, 255)], 0.12 + 0.12 * math.sin(now * (2 + 4 * heat))))
+    title = " " + cut(info["chip"], cwid - 6) + " "
+    cv.put(cx0, cy0, "╭─" + title + "─" * (cwid - 3 - len(title)) + "╮", chip_edge)
+    cv.put(cx0 + 2, cy0, title, BOLD + chip_edge)
+    cv.put(cx0, cy0 + 3, "╰" + "─" * (cwid - 2) + "╯", chip_edge)
+    cores = s["e_cores"] + s["p_cores"]
+    for i, (label, col, t, load) in enumerate((("CPU", P_P, t_cpu, sum(cores) / len(cores) if cores else 0.0),
+                                               ("GPU", P_GPU, t_gpu if t_gpu is not None else t_cpu, s["gpu"]))):
+        y = cy0 + 1 + i
+        cv.put(cx0, y, "│", chip_edge)
+        cv.put(cx0 + cwid - 1, y, "│", chip_edge)
+        cv.put(cx0 + 2, y, label, BOLD + rgb(col))
+        cv.put(cx0 + 7, y, "%3d°C" % t if t is not None else "  n/a", BOLD + rgb(temp_rgb(t or 0)))
+        cv.put(cx0 + 14, y, "%3d%%" % round(100 * (load or 0)), TEXT)
+
+    # ---- power summary inside the body
+    notes = []
+    if bat:
+        notes.append((TEXT, "Battery %d%%  %s" % (bat["pct"], bat["state"])))
+        if bat.get("in_w"):
+            notes.append((BOLD + rgb(P_PWR), "Power in %.1f W  (%.1f V × %.2f A)" % (
+                bat["in_w"], bat.get("in_v") or 0, bat.get("in_a") or 0)))
+        if bat.get("load_w"):
+            notes.append((rgb(P_MUTED), "Whole Mac is using %.1f W" % bat["load_w"]))
+        if bat.get("bat_w") and abs(bat["bat_w"]) > 0.2:
+            notes.append((rgb(P_MUTED), "Battery %s %.1f W" % ("charging at" if bat["bat_w"] > 0 else "giving", abs(bat["bat_w"]))))
+        if bat.get("adapter_w"):
+            notes.append((rgb(P_MUTED), "Charger: %d W %s" % (bat["adapter_w"], bat.get("adapter_name") or "")))
+    else:
+        notes.append((rgb(P_MUTED), "No battery: runs from the wall"))
+    if s.get("has_power", True):
+        notes.append((rgb(P_MUTED), "Chip alone is using %.1f W" % s["total_w"]))
+    for i, (style, text) in enumerate(notes):
+        y = cy0 + 5 + i
+        if y >= by1:
+            break
+        text = cut(text.strip(), bw - 4)
+        cv.put(bx0 + (bw - len(text)) // 2, y, text, style)
+
+    # ---- heat: red worms crawl from the chip to where the heat leaves the case
+    speed, count = 5 + 16 * heat, 1 + int(heat * 3)
+    xl, xr = cx0 + 2, cx0 + cwid - 3
+    if fanless:                                   # no fan: heat soaks into the whole metal case
+        mid = bx0 + bw // 2
+        side_l = [(bx0, y, "┃") for y in range(by0 + 1, by1)]
+        side_r = [(bx1, y, "┃") for y in range(by0 + 1, by1)]
+        paths = [[(x, by0, "━") for x in range(mid, bx0, -1)] + side_l + [(x, by1, "━") for x in range(bx0 + 1, mid)],
+                 [(x, by0, "━") for x in range(mid + 1, bx1)] + side_r + [(x, by1, "━") for x in range(bx1 - 1, mid, -1)]]
+        speed *= 0.5
+        msg = "no fan: heat spreads through the metal case"
+    else:                                         # fans push hot air out of the back edge
+        paths = [[(xl, y, "┃") for y in range(cy0 - 1, by0, -1)] + [(x, by0, "━") for x in range(xl, bx0, -1)],
+                 [(xr, y, "┃") for y in range(cy0 - 1, by0, -1)] + [(x, by0, "━") for x in range(xr, bx1)]]
+        msg = "▲ hot air leaves at the back" + (" (hinge vents)" if laptop else "")
+        fans = [f for f in temps.get("fans") or [] if f is not None]
+        if fans:
+            rpm = max(fans)
+            msg += "  ·  fans %d rpm" % rpm if rpm > 100 else "  ·  fans resting"
+        for x in range(bx0 + 2, bx1 - 1, 3):      # air shimmering off the back edge
+            f = 0.5 + 0.5 * math.sin(now * (2 + 5 * heat) + x * 1.7)
+            cv.put(x, by0 - 1, "˙" if f > 0.66 else "·" if f > 0.33 else ".", rgb(grad([P_BORDER, hot], 0.25 + 0.75 * f)))
+    for path in paths:
+        loop = len(path) + 8.0
+        for j in range(count):
+            head = (now * speed + j * loop / count) % loop          # not rounded: the worm glides between cells
+            for k in range(max(0, int(head) - 7), min(len(path), int(head) + 2)):
+                d = head - k
+                f = 1 + d if d < 0 else 1 - d / 7.0                 # soft nose, long fading tail
+                if f > 0:
+                    x, y, c = path[k]
+                    cv.put(x, y, c, (BOLD if f > 0.6 else "") + rgb(grad([P_BORDER, hot], f)))
+    msg = cut(msg, cw)
+    cv.put(max(0, bx0 + (bw - len(msg)) // 2), 0, msg, BOLD + rgb(hot))
+
+    # ---- the ports
+    chargers = [p for p in pw.ports if p.get("charge")]
+    matched = usb_by_port(pw)
+    outs = getattr(pw, "out", {})
+    if info.get("smc"):
+        try:
+            outs = info["smc"].port_out()
+        except Exception:
+            pass
+
+    def side(items, is_left):
+        if not items:
+            return
+        span = by1 - by0 - 1
+        slot = max(2, span // len(items))
+        for i, p in enumerate(items):
+            y = by0 + 1 + i * span // len(items) + max(0, (slot - 3) // 2)
+            name, lines, flow, col = port_text(p, pw, bat, info["chip"], len(chargers) == 1,
+                                               (matched or {}).get(p["id"], []),
+                                               outs.get(p["num"]) if p["kind"].startswith("USB-C") else None)
+            live = flow is not None or p["active"]
+            glow = BOLD + rgb(grad([col, (255, 255, 255)], 0.3 + 0.3 * math.sin(now * 5))) if live else rgb(P_DIM)
+            glyph = next((g for k, g in PORT_GLYPH.items() if p["kind"].startswith(k)), "(··)")
+            cv.put(bx0 - 1 if is_left else bx1 + 2 - len(glyph), y, glyph, glow)
+            xs = range(lw, bx0 - 1) if is_left else range(bx1 + 2, bx1 + 2 + flow_w)
+            inward = 1 if is_left else -1         # which way is "into the Mac" on this side
+            xs = list(xs)
+            white = (255, 255, 255)
+            for n, x in enumerate(xs):
+                if not flow:
+                    cv.put(x, y, "┄", rgb(P_DIM))
+                    continue
+                # light glides along the cable: brightness is a wave, so it moves smoothly between cells
+                into = 0.5 + 0.5 * math.sin(2 * math.pi * (inward * x / 5.0 - now * 1.6))
+                f = into ** 3
+                if flow == "both":
+                    f = max(f, (0.5 + 0.5 * math.sin(2 * math.pi * (-inward * x / 5.0 - now * 1.1))) ** 3)
+                near_mac = n == (len(xs) - 1 if is_left else 0)
+                near_dev = n == (0 if is_left else len(xs) - 1)
+                ch = "━"
+                if near_mac:
+                    ch = "▶" if is_left else "◀"
+                elif near_dev and flow == "both":
+                    ch = "◀" if is_left else "▶"
+                cv.put(x, y, ch, BOLD + rgb(grad([grad([col, P_BORDER], 0.6), grad([col, white], 0.45)], f)))
+            soft = rgb(grad([col, P_MUTED], 0.6))             # first detail line stands out, the rest sit back
+            rows_ = [(name, TEXT if live else rgb(P_MUTED))] + [
+                (l, (BOLD + rgb(col) if k == 0 else soft) if live else rgb(P_DIM)) for k, l in enumerate(lines)]
+            for k, (text, style) in enumerate(rows_[:slot]):
+                if is_left:
+                    text = cut(text, lw - 1)
+                    cv.put(lw - 1 - len(text), y + k, text, style)
+                else:
+                    x = bx1 + 3 + flow_w
+                    cv.put(x, y + k, cut(text, cw - x), style)
+
+    side(left, True)
+    side(right, False)
+
+    # ---- notes under the body
+    loose = [d["name"] for d in pw.usb] if matched is None else []
+    if not pw.ports:
+        note = "this macOS does not report its ports, so only power and heat are shown"
+    elif loose:
+        note = "USB devices: " + ", ".join(loose)
+    else:
+        note = "port sides come from the Mac model  ·  what is plugged in is read live"
+    if pw.usb and matched is not None:
+        note = ("power out is measured live by the Mac's own port sensors" if outs else
+                "\"out up to\" is the most a device may draw: this Mac has no port power sensors mtop can read")
+    cv.put(1, H - 2, cut(note, cw - 2), rgb(P_DIM))
+    cv.put(1, H - 1, "━▶", BOLD + rgb(P_PWR))
+    cv.put(4, H - 1, "power in", rgb(P_MUTED))
+    cv.put(15, H - 1, "◀▶", BOLD + rgb(P_UP))
+    cv.put(18, H - 1, "device", rgb(P_MUTED))
+    cv.put(27, H - 1, "◀▶", BOLD + rgb(P_NET))
+    cv.put(30, H - 1, "display", rgb(P_MUTED))
+    cv.put(40, H - 1, "━", BOLD + rgb(hot))
+    cv.put(42, H - 1, "heat", rgb(P_MUTED))
+    return panel("This Mac: ports, power & heat", cv.lines(), W, P_PWR, muted(model))
+
+
 # ============================================================ rendering
 def render(st, s, mem, pressure, temps, dsk, bat, info, cols, rows):
     W = max(60, min(cols, 160))
@@ -942,162 +1521,166 @@ def render(st, s, mem, pressure, temps, dsk, bat, info, cols, rows):
         return dim("%6s " % "cores") + gap.join(
             rgb(grad(G_LOAD, c)) + VBAR[max(1, int(round(c * 8)))] * wide for c in cs) + RESET
 
-    # ---- row 1: CPU | GPU & Memory
-    inner = wl - 4
-    bw, gw = max(8, inner - 24), inner - 7
-    e, p = st.h["e"][-1], st.h["p"][-1]
-    speed = lambda mhz, cores: "%4d MHz" % mhz if mhz else "%d cores" % len(cores)
-    if s["e_cores"] and s["p_cores"]:
-        cpu = [gauge("E-CPU", e, P_E, pct(e), speed(s["e_mhz"], s["e_cores"]), bw, G_E)]
-        cpu += graph_rows(st.h["e"], gw, h, 1.0, G_E, hi="100%", lo="0%" if h > 1 else "")
-        cpu += [cores_row(s["e_cores"], gw), "",
-                gauge("P-CPU", p, P_P, pct(p), speed(s["p_mhz"], s["p_cores"]), bw, G_P)]
-        cpu += graph_rows(st.h["p"], gw, h, 1.0, G_P, hi="100%", lo="0%" if h > 1 else "")
-        cpu.append(cores_row(s["p_cores"], gw))
-    else:                                         # Intel, or any chip with one kind of core
-        cs = s["p_cores"] or s["e_cores"]
-        v = p if s["p_cores"] else e
-        cpu = [gauge("CPU", v, P_P, pct(v), speed(s["p_mhz"] or s["e_mhz"], cs), bw, G_P), ""]
-        cpu += graph_rows(st.h["p" if s["p_cores"] else "e"], gw, body_lines - 4, 1.0, G_P, hi="100%", lo="0%")
-        cpu += ["", cores_row(cs, gw)]
-    load = info.get("load")
-    cpu_right = muted("load ") + TEXT + "%.2f" % load if load is not None else ""
-
-    used, total, sw_u, sw_t, cached, wired, comp = mem
-    ram_f = used / total if total else 0
-    inner = wr - 4
-    bw, gw = max(8, inner - 24), inner - 7
-    app = max(0.0, used - wired - comp)
-    cache_seg = max(0.0, min(cached, total - used))
-    p_col = GOOD if pressure == "normal" else WARN if pressure == "warning" else BAD
-    gm = [gauge("GPU", s["gpu"], P_GPU, pct(s["gpu"]), "%4d MHz" % s["gpu_mhz"] if s["gpu_mhz"] else "", bw, G_GPU)]
-    gm += graph_rows(st.h["gpu"], gw, h, 1.0, G_GPU, hi="100%", lo="0%" if h > 1 else "")
-    gm.append(dim("%6s " % "VRAM") + TEXT + "%.1f GB" % s["gpu_mem"] + RESET + muted(" in use, shared with RAM")
-              if s.get("gpu_mem") is not None else "")
-    gm.append(BOLD + rgb(P_RAM) + "%-6s" % "RAM" + RESET + " "
-              + stacked([(app, SEG_APP), (wired, SEG_WIRED), (comp, SEG_COMP), (cache_seg, SEG_CACHE)], total, bw)
-              + " " + pct(ram_f) + " " + muted("%.1f/%.0f GB" % (used, total)))
-    gm.append(" " + " ".join(dot(c, muted(n + " ") + TEXT + "%.1f" % v + RESET) for c, n, v in (
-        (SEG_APP, "app", app), (SEG_WIRED, "wired", wired), (SEG_COMP, "comp", comp), (SEG_CACHE, "cache", cached))))
-    gm += graph_rows(st.h["ram"], gw, h, 1.0, G_RAM, hi="100%", lo="0%" if h > 1 else "")
-    swap_txt = ("%.1f GB used" % sw_u) if sw_u > 0.05 else "inactive"
-    gm.append(BOLD + rgb(P_MUTED) + "%-6s" % "Swap" + RESET + " " + TEXT + swap_txt + RESET
-              + muted("    pressure ") + dot(p_col, BOLD + rgb(p_col) + pressure + RESET))
-    row(panel("CPU", cpu, wl, P_E, cpu_right),
-        panel("GPU & Memory", gm, wr, P_GPU, muted("%.0f GB memory" % total) if total else ""))
-
-    # ---- row 2: Temperatures | Storage, Battery & Network
-    inner = wl - 4
-    bw, gw = max(8, inner - 24), inner - 7
-    tl = []
-    for label, key, hist, col in (("CPU", "cpu", "t_cpu", P_P), ("GPU", "gpu", "t_gpu", P_GPU)):
-        v = temps.get(key)
-        if v is None:
-            why = "no separate sensor: it shares the CPU's chip" if key == "gpu" and temps.get("cpu") is not None \
-                else "sensor not available"
-            tl += [BOLD + rgb(P_MUTED) + "%-6s" % label + RESET + " " + dim(why)] + [""] * h
-        else:
-            tl.append(gauge(label, v / 105.0, col, BOLD + rgb(temp_rgb(v)) + "%3d°C" % v,
-                            "max %d°C" % temps[key + "_max"], bw, G_TEMP))
-            tl += graph_rows(st.h[hist], gw, h, 105, G_TEMP, 20, hi="105°", lo="20°" if h > 1 else "")
-        if key == "cpu":
-            tl.append("")
-    extra = []
-    if temps.get("ssd") is not None:
-        extra.append(muted("SSD ") + BOLD + rgb(temp_rgb(temps["ssd"])) + "%d°C" % temps["ssd"] + RESET)
-    if bat and bat.get("temp"):
-        extra.append(muted("Battery ") + BOLD + rgb(temp_rgb(bat["temp"])) + "%d°C" % bat["temp"] + RESET)
-    tl.append(" " + "    ".join(extra) if extra else dim(" no SSD / battery sensors"))
-    tl.append(" " + "  ".join(dot(c, dim(t)) for c, t in ((GOOD, "<70"), (WARN, "70-85"), (HOT, "85-95"),
-                                                           (BAD, "95+ °C"))))
-    th_col = GOOD if th == "Nominal" else BAD
-
-    inner = wr - 4
-    bw, gw = max(8, inner - 24), inner - 7
-    d_used, d_total, d_free = dsk
-    d_f = d_used / d_total if d_total else 0
-    smart = info["smart"]
-    sl = [gauge("SSD", d_f, P_DSK, pct(d_f), "%.0f GB free" % d_free, bw, G_DSK if d_f < 0.85 else [WARN, BAD]),
-          dim("%6s " % "I/O") + muted("R ") + TEXT + human_rate(s["disk_r"]) + RESET + muted("  W ") + TEXT
-          + human_rate(s["disk_w"]) + RESET + "  "
-          + dot(GOOD if smart == "Verified" else WARN, muted("SMART " + ("ok" if smart == "Verified" else smart)))]
-    if h > 1:
-        sl.append("")
-    if bat:
-        b_col = GOOD if bat["pct"] > 40 else WARN if bat["pct"] > 20 else BAD
-        sl.append(gauge("Batt", bat["pct"] / 100.0, P_PWR, TEXT + "%3d%%" % bat["pct"], bat["state"], bw, [b_col]))
-        detail = []
-        if bat["health"]:
-            detail.append(muted("health ") + TEXT + "%.0f%%" % bat["health"] + RESET)
-        detail.append(TEXT + str(bat["cycles"]) + RESET + muted(" cycles"))
-        sl.append(" " * 7 + "   ".join(detail))
+    if st.view == "mac":
+        body = mac_view(st, s, temps, bat, info, W, max(13, min(36, rows - len(head) - fixed + 1 - 2)))
+        st.rows_hit = (0, 0, 0, 0)
     else:
-        sl += [BOLD + rgb(P_MUTED) + "%-6s" % "Batt" + RESET + " " + dim("no battery (desktop Mac)"), ""]
-    if h > 1:
-        sl.append("")
-    sl.append(BOLD + rgb(P_NET) + "%-6s" % "Net" + RESET + " " + rgb(P_NET) + "↓ " + TEXT + human_rate(s["net_in"])
-              + RESET + "   " + rgb(P_UP) + "↑ " + TEXT + human_rate(s["net_out"]) + RESET)
-    g = max(2, body_lines - len(sl))          # mirrored graph: download grows up, upload hangs down
-    up_rows = g // 2
-    n_in, n_out = list(st.h["net_in"])[-gw * 2:], list(st.h["net_out"])[-gw * 2:]
-    top_in, top_out = max(n_in + [10e3]), max(n_out + [10e3])
-    sl += graph_rows(n_in, gw, g - up_rows, top_in, G_NET, hi=short_rate(top_in))
-    sl += graph_rows(n_out, gw, up_rows, top_out, G_UP, lo=short_rate(top_out), invert=True)[:up_rows] if up_rows else []
-    row(panel("Temperatures", tl, wl, P_TMP, dot(th_col, muted(th.lower())) if th else ""),
-        panel("Storage, Battery & Network", sl, wr, P_DSK, muted("%.0f GB" % d_total) if d_total else ""))
+        # ---- row 1: CPU | GPU & Memory
+        inner = wl - 4
+        bw, gw = max(8, inner - 24), inner - 7
+        e, p = st.h["e"][-1], st.h["p"][-1]
+        speed = lambda mhz, cores: "%4d MHz" % mhz if mhz else "%d cores" % len(cores)
+        if s["e_cores"] and s["p_cores"]:
+            cpu = [gauge("E-CPU", e, P_E, pct(e), speed(s["e_mhz"], s["e_cores"]), bw, G_E)]
+            cpu += graph_rows(st.h["e"], gw, h, 1.0, G_E, hi="100%", lo="0%" if h > 1 else "")
+            cpu += [cores_row(s["e_cores"], gw), "",
+                    gauge("P-CPU", p, P_P, pct(p), speed(s["p_mhz"], s["p_cores"]), bw, G_P)]
+            cpu += graph_rows(st.h["p"], gw, h, 1.0, G_P, hi="100%", lo="0%" if h > 1 else "")
+            cpu.append(cores_row(s["p_cores"], gw))
+        else:                                         # Intel, or any chip with one kind of core
+            cs = s["p_cores"] or s["e_cores"]
+            v = p if s["p_cores"] else e
+            cpu = [gauge("CPU", v, P_P, pct(v), speed(s["p_mhz"] or s["e_mhz"], cs), bw, G_P), ""]
+            cpu += graph_rows(st.h["p" if s["p_cores"] else "e"], gw, body_lines - 4, 1.0, G_P, hi="100%", lo="0%")
+            cpu += ["", cores_row(cs, gw)]
+        load = info.get("load")
+        cpu_right = muted("load ") + TEXT + "%.2f" % load if load is not None else ""
 
-    # ---- row 3: Power | Top apps
-    apps_top = len(head) + len(body) + (0 if two else body_lines + 2)
-    inner = wl - 4
-    gw = inner - 7
-    sw = max(6, inner - 37)
-    pw = []
-    for key, label, color, stops in (("cpu_w", "CPU", P_P, G_P), ("gpu_w", "GPU", P_GPU, G_GPU),
-                                     ("ane_w", "ANE", P_E, G_E), ("total_w", "Total", P_PWR, G_PWR)):
-        pw.append(BOLD + rgb(color) + "%-5s" % label + RESET + " " + TEXT + "%6.2f W" % s[key] + RESET
-                  + muted("  avg %5.2f  pk %5.2f " % (st.sum[key] / max(1, st.n), st.peak[key]))
-                  + graph(st.h[key], sw, 1, max(st.peak[key], 0.5), stops)[0])
-    if h > 1:
-        pw.append("")
-    top_w = max(1.0, math.ceil(st.peak["total_w"]))
-    pw += graph_rows(st.h["total_w"], gw, body_lines - len(pw) - 1, top_w, G_PWR, hi="%d W" % top_w, lo="0 W")
-    energy = "%.1f mWh" % (st.wh * 1000) if st.wh < 1 else "%.2f Wh" % st.wh
-    pw.append(muted(" energy used ") + TEXT + energy + RESET + muted(" since start"))
+        used, total, sw_u, sw_t, cached, wired, comp = mem
+        ram_f = used / total if total else 0
+        inner = wr - 4
+        bw, gw = max(8, inner - 24), inner - 7
+        app = max(0.0, used - wired - comp)
+        cache_seg = max(0.0, min(cached, total - used))
+        p_col = GOOD if pressure == "normal" else WARN if pressure == "warning" else BAD
+        gm = [gauge("GPU", s["gpu"], P_GPU, pct(s["gpu"]), "%4d MHz" % s["gpu_mhz"] if s["gpu_mhz"] else "", bw, G_GPU)]
+        gm += graph_rows(st.h["gpu"], gw, h, 1.0, G_GPU, hi="100%", lo="0%" if h > 1 else "")
+        gm.append(dim("%6s " % "VRAM") + TEXT + "%.1f GB" % s["gpu_mem"] + RESET + muted(" in use, shared with RAM")
+                  if s.get("gpu_mem") is not None else "")
+        gm.append(BOLD + rgb(P_RAM) + "%-6s" % "RAM" + RESET + " "
+                  + stacked([(app, SEG_APP), (wired, SEG_WIRED), (comp, SEG_COMP), (cache_seg, SEG_CACHE)], total, bw)
+                  + " " + pct(ram_f) + " " + muted("%.1f/%.0f GB" % (used, total)))
+        gm.append(" " + " ".join(dot(c, muted(n + " ") + TEXT + "%.1f" % v + RESET) for c, n, v in (
+            (SEG_APP, "app", app), (SEG_WIRED, "wired", wired), (SEG_COMP, "comp", comp), (SEG_CACHE, "cache", cached))))
+        gm += graph_rows(st.h["ram"], gw, h, 1.0, G_RAM, hi="100%", lo="0%" if h > 1 else "")
+        swap_txt = ("%.1f GB used" % sw_u) if sw_u > 0.05 else "inactive"
+        gm.append(BOLD + rgb(P_MUTED) + "%-6s" % "Swap" + RESET + " " + TEXT + swap_txt + RESET
+                  + muted("    pressure ") + dot(p_col, BOLD + rgb(p_col) + pressure + RESET))
+        row(panel("CPU", cpu, wl, P_E, cpu_right),
+            panel("GPU & Memory", gm, wr, P_GPU, muted("%.0f GB memory" % total) if total else ""))
 
-    pw_right = muted("peak ") + TEXT + "%.1f W" % st.peak["total_w"]
-    if not s.get("has_power", True):
-        pw_right = muted("basic mode")
-        pw = ["", muted(" Watts and MHz need administrator access."), "",
-              muted(" Press ") + TEXT + "q" + RESET + muted(", then run mtop without ") + TEXT + "--no-sudo" + RESET,
-              muted(" and type your Mac password when asked."), "",
-              dim(" Everything else on this screen is live.")]
+        # ---- row 2: Temperatures | Storage, Battery & Network
+        inner = wl - 4
+        bw, gw = max(8, inner - 24), inner - 7
+        tl = []
+        for label, key, hist, col in (("CPU", "cpu", "t_cpu", P_P), ("GPU", "gpu", "t_gpu", P_GPU)):
+            v = temps.get(key)
+            if v is None:
+                why = "no separate sensor: it shares the CPU's chip" if key == "gpu" and temps.get("cpu") is not None \
+                    else "sensor not available"
+                tl += [BOLD + rgb(P_MUTED) + "%-6s" % label + RESET + " " + dim(why)] + [""] * h
+            else:
+                tl.append(gauge(label, v / 105.0, col, BOLD + rgb(temp_rgb(v)) + "%3d°C" % v,
+                                "max %d°C" % temps[key + "_max"], bw, G_TEMP))
+                tl += graph_rows(st.h[hist], gw, h, 105, G_TEMP, 20, hi="105°", lo="20°" if h > 1 else "")
+            if key == "cpu":
+                tl.append("")
+        extra = []
+        if temps.get("ssd") is not None:
+            extra.append(muted("SSD ") + BOLD + rgb(temp_rgb(temps["ssd"])) + "%d°C" % temps["ssd"] + RESET)
+        if bat and bat.get("temp"):
+            extra.append(muted("Battery ") + BOLD + rgb(temp_rgb(bat["temp"])) + "%d°C" % bat["temp"] + RESET)
+        tl.append(" " + "    ".join(extra) if extra else dim(" no SSD / battery sensors"))
+        tl.append(" " + "  ".join(dot(c, dim(t)) for c, t in ((GOOD, "<70"), (WARN, "70-85"), (HOT, "85-95"),
+                                                               (BAD, "95+ °C"))))
+        th_col = GOOD if th == "Nominal" else BAD
 
-    inner = wr - 4
-    name_w = max(6, inner - 29)
-    st.rows = body_lines - 1
-    procs = st.sorted_procs()
-    pids = [r[0] for r in procs]
-    if st.sel_pid in pids:                        # keep the same app selected when the list reorders
-        st.sel = pids.index(st.sel_pid)
-    st.sel = min(st.sel, max(0, len(procs) - 1))
-    st.sel_pid = pids[st.sel] if pids else None
-    arrow = lambda k: "▾" if st.sort == k else " "
-    pl = [muted(" %6s %5s%s%5s %7s%s %s" % ("PID", "CPU%", arrow("cpu"), "", "RAM", arrow("mem"), "APP"))]
-    for i, (pid, user, cpu_p, rss, name) in enumerate(procs):
-        f = min(1.0, cpu_p / 100.0)
-        if i == st.sel:
-            cells = f * 5
-            plain = "█" * int(cells) + (HBAR[int((cells - int(cells)) * 8)] if int(cells) < 5 else "")
-            txt = " %6d %5.1f %-5s %7s  %s" % (pid, min(cpu_p, 999.9), plain, human_mem(rss), cut(name, name_w))
-            pl.append(rgb(P_ACCENT, bg=True) + "\x1b[97m" + BOLD + pad(txt, inner) + RESET)
+        inner = wr - 4
+        bw, gw = max(8, inner - 24), inner - 7
+        d_used, d_total, d_free = dsk
+        d_f = d_used / d_total if d_total else 0
+        smart = info["smart"]
+        sl = [gauge("SSD", d_f, P_DSK, pct(d_f), "%.0f GB free" % d_free, bw, G_DSK if d_f < 0.85 else [WARN, BAD]),
+              dim("%6s " % "I/O") + muted("R ") + TEXT + human_rate(s["disk_r"]) + RESET + muted("  W ") + TEXT
+              + human_rate(s["disk_w"]) + RESET + "  "
+              + dot(GOOD if smart == "Verified" else WARN, muted("SMART " + ("ok" if smart == "Verified" else smart)))]
+        if h > 1:
+            sl.append("")
+        if bat:
+            b_col = GOOD if bat["pct"] > 40 else WARN if bat["pct"] > 20 else BAD
+            sl.append(gauge("Batt", bat["pct"] / 100.0, P_PWR, TEXT + "%3d%%" % bat["pct"], bat["state"], bw, [b_col]))
+            detail = []
+            if bat["health"]:
+                detail.append(muted("health ") + TEXT + "%.0f%%" % bat["health"] + RESET)
+            detail.append(TEXT + str(bat["cycles"]) + RESET + muted(" cycles"))
+            sl.append(" " * 7 + "   ".join(detail))
         else:
-            lc = load_rgb(f)
-            pl.append(dim(" %6d " % pid) + rgb(lc) + "%5.1f " % min(cpu_p, 999.9) + bar(f, 5, [lc], " ")
-                      + " " + muted("%7s" % human_mem(rss)) + "  " + cut(name, name_w))
-    row(panel("Power", pw, wl, P_PWR, pw_right),
-        panel("Top apps", pl, wr, P_ACCENT, muted("sorted by ") + TEXT + ("CPU" if st.sort == "cpu" else "RAM")))
+            sl += [BOLD + rgb(P_MUTED) + "%-6s" % "Batt" + RESET + " " + dim("no battery (desktop Mac)"), ""]
+        if h > 1:
+            sl.append("")
+        sl.append(BOLD + rgb(P_NET) + "%-6s" % "Net" + RESET + " " + rgb(P_NET) + "↓ " + TEXT + human_rate(s["net_in"])
+                  + RESET + "   " + rgb(P_UP) + "↑ " + TEXT + human_rate(s["net_out"]) + RESET)
+        g = max(2, body_lines - len(sl))          # mirrored graph: download grows up, upload hangs down
+        up_rows = g // 2
+        n_in, n_out = list(st.h["net_in"])[-gw * 2:], list(st.h["net_out"])[-gw * 2:]
+        top_in, top_out = max(n_in + [10e3]), max(n_out + [10e3])
+        sl += graph_rows(n_in, gw, g - up_rows, top_in, G_NET, hi=short_rate(top_in))
+        sl += graph_rows(n_out, gw, up_rows, top_out, G_UP, lo=short_rate(top_out), invert=True)[:up_rows] if up_rows else []
+        row(panel("Temperatures", tl, wl, P_TMP, dot(th_col, muted(th.lower())) if th else ""),
+            panel("Storage, Battery & Network", sl, wr, P_DSK, muted("%.0f GB" % d_total) if d_total else ""))
 
-    st.rows_hit = (apps_top + 3, len(procs), wl + 2 if two else 1, W)
+        # ---- row 3: Power | Top apps
+        apps_top = len(head) + len(body) + (0 if two else body_lines + 2)
+        inner = wl - 4
+        gw = inner - 7
+        sw = max(6, inner - 37)
+        pw = []
+        for key, label, color, stops in (("cpu_w", "CPU", P_P, G_P), ("gpu_w", "GPU", P_GPU, G_GPU),
+                                         ("ane_w", "ANE", P_E, G_E), ("total_w", "Total", P_PWR, G_PWR)):
+            pw.append(BOLD + rgb(color) + "%-5s" % label + RESET + " " + TEXT + "%6.2f W" % s[key] + RESET
+                      + muted("  avg %5.2f  pk %5.2f " % (st.sum[key] / max(1, st.n), st.peak[key]))
+                      + graph(st.h[key], sw, 1, max(st.peak[key], 0.5), stops)[0])
+        if h > 1:
+            pw.append("")
+        top_w = max(1.0, math.ceil(st.peak["total_w"]))
+        pw += graph_rows(st.h["total_w"], gw, body_lines - len(pw) - 1, top_w, G_PWR, hi="%d W" % top_w, lo="0 W")
+        energy = "%.1f mWh" % (st.wh * 1000) if st.wh < 1 else "%.2f Wh" % st.wh
+        pw.append(muted(" energy used ") + TEXT + energy + RESET + muted(" since start"))
+
+        pw_right = muted("peak ") + TEXT + "%.1f W" % st.peak["total_w"]
+        if not s.get("has_power", True):
+            pw_right = muted("basic mode")
+            pw = ["", muted(" Watts and MHz need administrator access."), "",
+                  muted(" Press ") + TEXT + "q" + RESET + muted(", then run mtop without ") + TEXT + "--no-sudo" + RESET,
+                  muted(" and type your Mac password when asked."), "",
+                  dim(" Everything else on this screen is live.")]
+
+        inner = wr - 4
+        name_w = max(6, inner - 29)
+        st.rows = body_lines - 1
+        procs = st.sorted_procs()
+        pids = [r[0] for r in procs]
+        if st.sel_pid in pids:                        # keep the same app selected when the list reorders
+            st.sel = pids.index(st.sel_pid)
+        st.sel = min(st.sel, max(0, len(procs) - 1))
+        st.sel_pid = pids[st.sel] if pids else None
+        arrow = lambda k: "▾" if st.sort == k else " "
+        pl = [muted(" %6s %5s%s%5s %7s%s %s" % ("PID", "CPU%", arrow("cpu"), "", "RAM", arrow("mem"), "APP"))]
+        for i, (pid, user, cpu_p, rss, name) in enumerate(procs):
+            f = min(1.0, cpu_p / 100.0)
+            if i == st.sel:
+                cells = f * 5
+                plain = "█" * int(cells) + (HBAR[int((cells - int(cells)) * 8)] if int(cells) < 5 else "")
+                txt = " %6d %5.1f %-5s %7s  %s" % (pid, min(cpu_p, 999.9), plain, human_mem(rss), cut(name, name_w))
+                pl.append(rgb(P_ACCENT, bg=True) + "\x1b[97m" + BOLD + pad(txt, inner) + RESET)
+            else:
+                lc = load_rgb(f)
+                pl.append(dim(" %6d " % pid) + rgb(lc) + "%5.1f " % min(cpu_p, 999.9) + bar(f, 5, [lc], " ")
+                          + " " + muted("%7s" % human_mem(rss)) + "  " + cut(name, name_w))
+        row(panel("Power", pw, wl, P_PWR, pw_right),
+            panel("Top apps", pl, wr, P_ACCENT, muted("sorted by ") + TEXT + ("CPU" if st.sort == "cpu" else "RAM")))
+
+        st.rows_hit = (apps_top + 3, len(procs), wl + 2 if two else 1, W)
 
     # ---- health check
     tail = []
@@ -1118,7 +1701,7 @@ def render(st, s, mem, pressure, temps, dsk, bat, info, cols, rows):
         buttons = (("y", "y", "yes, quit it"), ("n", "n", "cancel"))
     else:
         buttons = (("q", "q", "quit"), ("ud", "↑↓", "select"), ("k", "k", "quit app"), ("s", "s", "sort CPU/RAM"),
-                   ("c", "c", "clear RAM cache"))
+                   ("c", "c", "clear RAM cache"), ("p", "p", "main view" if st.view == "mac" else "ports & heat"))
     for action, label, txt in buttons:
         w = len(label) + 3 + len(txt)
         st.hot.append((x, x + w - 1, action))
@@ -1178,6 +1761,9 @@ def act(action, st, demo):
             else:
                 st.confirm = (pid, name)
                 st.msg = ""
+    elif action == "p":
+        st.view = "main" if st.view == "mac" else "mac"
+        st.msg = "showing ports, power and heat" if st.view == "mac" else "back to the main view"
     elif action == "c":
         if st.purge is not None:
             st.msg = "still clearing cache..."
@@ -1227,7 +1813,7 @@ def handle_input(data, st, demo):
         action = data[:1].lower()
     if st.confirm:
         return act("y" if action == "y" else "n", st, demo)
-    if action not in ("q", "up", "down", "s", "k", "c"):
+    if action not in ("q", "up", "down", "s", "k", "c", "p"):
         return True
     return act(action, st, demo)
 
@@ -1285,7 +1871,8 @@ def main():
         except OSError:
             st.msg = "power readings unavailable on this Mac: basic mode"
     info = {"chip": chip, "cores": cores, "smart": "Verified" if a.demo else smart_status(),
-            "uptime": "", "load": None}
+            "uptime": "", "load": None, "ports": DemoPorts() if a.demo else PortWatch(),
+            "smc": temps_src.smc if temps_src else None}
     booted = time.time() - 273600 if a.demo else boot_time()
     last = {"ps": 0.0, "bat": 0.0, "dsk": 0.0, "sample": 0.0}
     bat, dsk = None, (0.0, 0.0, 0.0)
@@ -1310,10 +1897,12 @@ def main():
     try:
         while True:
             fds = [sys.stdin] if tty else []
+            anim = 0.05 if st.view == "mac" and st.last else None      # the ports view is animated
             if src:
-                r, _, _ = select.select(fds + [src.fd], [], [])
+                r, _, _ = select.select(fds + [src.fd], [], [], anim)
             else:
-                r, _, _ = select.select(fds, [], [], max(0.0, next_tick - time.time()))
+                wait = max(0.0, next_tick - time.time())
+                r, _, _ = select.select(fds, [], [], min(wait, anim) if anim else wait)
             if sys.stdin in r:
                 if not handle_input(os.read(sys.stdin.fileno(), 256).decode(errors="ignore"), st, a.demo):
                     break
@@ -1345,14 +1934,17 @@ def main():
                 if a.demo:
                     mem, pressure, temps = (14.4 + math.sin(demo.t / 3), 24.0, 0.0, 0.0, 6.2, 2.1, 0.8), "normal", demo.temps()
                     st.procs = demo.procs()
-                    bat = {"pct": 87, "health": 94, "cycles": 143, "temp": 31.0, "state": "charging"}
+                    bat = {"pct": 87, "health": 94, "cycles": 143, "temp": 31.0, "state": "charging", "plugged": True,
+                           "in_w": 58 + 6 * math.sin(demo.t / 2), "in_v": 20.1, "in_a": (58 + 6 * math.sin(demo.t / 2)) / 20.1,
+                           "load_w": 30 + 6 * math.sin(demo.t / 2), "bat_w": 28.0, "adapter_w": 96,
+                           "adapter_name": "pd charger"}
                     dsk = (310.0, 494.0, 184.0)
                     info["load"] = 1.2 + 4 * st.h["p"][-1] if st.h["p"] else 2.0
                 else:
                     mem, pressure, temps = memory(), memory_pressure(), temps_src.read()
                     if now - last["ps"] > 2:
                         st.procs, last["ps"] = processes(), now
-                    if now - last["bat"] > 15:
+                    if now - last["bat"] > 2:
                         bat, last["bat"] = battery(), now
                     if now - last["dsk"] > 10:
                         dsk, last["dsk"] = disk_usage(), now

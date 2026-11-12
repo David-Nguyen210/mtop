@@ -58,8 +58,22 @@ python3 ~/mtop.py --no-sudo
 | `k` | quit the selected app (asks first) |
 | `s` | sort apps by CPU or RAM |
 | `c` | clear the RAM cache |
+| `p` | ports, power and heat view (press `p` again to go back) |
 
 You can also click the buttons at the bottom with the mouse, click an app, or scroll.
+
+## Ports, power and heat view
+
+Press `p` to see a picture of your Mac with its ports:
+
+- which ports have something plugged in, and what it is (drive, display, charger)
+- the watts coming in from the charger, and the watts going out of each USB-C port
+- for a drive: its size, free space and read / write speed
+- whether each port is Thunderbolt 3, 4 or 5
+- where the heat leaves the Mac, and how fast the fans spin
+
+Port details are best on Macs with an Apple chip. If your Mac does not report
+something, mtop leaves it out instead of guessing.
 
 ## Questions
 
