@@ -49,6 +49,38 @@ Use basic mode. It shows everything except watts and clock speed:
 python3 ~/mtop.py --no-sudo
 ```
 
+## Two looks: pick the one you like
+
+**Classic** is everything above. It stays exactly as it is.
+
+**New look** is a redesign you can try next to it. It has three screens you switch
+with `1`, `2`, `3` or `Tab`:
+
+| Screen | What it shows |
+| --- | --- |
+| `1` Overview | CPU, GPU, memory, temperatures, SSD, battery, network, power and the busiest apps |
+| `2` Ports & power | your Mac seen from above: what is plugged in where, watts in and out of each port, heat and fans |
+| `3` Core | the chip alive: every core is a dot in orbit, and the busier it is, the faster it circles |
+
+It also counts memory and each app's CPU and RAM the same way Activity Monitor does,
+shows battery health as the figure macOS shows in System Settings, and shows the whole
+Mac's watts even without a password.
+
+To try the new look, paste this into Terminal:
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/David-Nguyen210/mtop/main/mtop-new.py -o ~/mtop-new.py && python3 ~/mtop-new.py
+```
+
+Next time: `python3 ~/mtop-new.py`. To go back to classic: `python3 ~/mtop.py`. Both can
+stay on your Mac side by side.
+
+Extra keys in the new look: `1` `2` `3` or `Tab` change screen, and `m` sets the motion
+to `smooth` (animated), `still` (one update a second) or `eco` (one update every 5
+seconds). Animation makes the Terminal app hold about 120 MB more memory while it
+plays, so `eco` is the lightest; the new look also rests by itself when its window is
+in the background. To remove it: `rm -r ~/mtop-new.py ~/Library/Caches/mtop`.
+
 ## Controls
 
 | Key | What it does |
