@@ -59,6 +59,9 @@ def _to256(r, g, b):
 
 def rgb(c, bg=False):
     """Escape code for an (r, g, b) colour."""
+    # snap to steps of 8: animations would otherwise create endless one-off colours, which both
+    # this program and the terminal app keep in memory
+    c = (c[0] & 0xF8, c[1] & 0xF8, c[2] & 0xF8)
     key = (c, bg, TRUECOLOR)
     if key not in _esc:
         lead = 48 if bg else 38
@@ -166,27 +169,33 @@ def pct(frac):
     return col + "%3d%%" % round(frac * 100) + RESET
 
 
+P_SEG = (66, 68, 86)             # unlit segments of a meter
+
+
 def bar(frac, width, stops=G_LOAD, track="░"):
-    """Smooth horizontal bar: gradient along its length, eighth-block precision."""
+    """Instrument-style meter: lit segments with a hairline gap between them, colour running along it."""
     frac = min(1.0, max(0.0, frac))
     cells = frac * width
     full = int(cells)
-    part = int((cells - full) * 8)
-    if frac > 0.004 and full == 0 and part == 0:
-        part = 1
+    rest = cells - full
+    part = "▌" if rest >= 0.5 else "▎" if rest >= 0.15 or (frac > 0.004 and full == 0) else ""
+    if full >= width:
+        part = ""
     out, last = [], None
-    for i in range(full + (1 if part and full < width else 0)):
+    for i in range(full + (1 if part else 0)):
         col = rgb(grad(stops, i / float(max(1, width - 1))))
         if col != last:
             out.append(col)
             last = col
-        out.append("█" if i < full else HBAR[part])
-    used = full + (1 if part and full < width else 0)
-    return "".join(out) + rgb(P_TRACK) + track * (width - used) + RESET
+        out.append("▊" if i < full else part)
+    used = full + (1 if part else 0)
+    if track == " ":
+        return "".join(out) + RESET + " " * (width - used)
+    return "".join(out) + rgb(P_SEG) + "▊" * (width - used) + RESET
 
 
 def stacked(segments, total, width):
-    """One bar split into coloured segments: [(value, colour), ...] out of `total`."""
+    """One segmented meter split into coloured parts: [(value, colour), ...] out of `total`."""
     out, last = [], None
     for i in range(width):
         x, acc, col = (i + 0.5) / width * total, 0.0, None
@@ -195,11 +204,11 @@ def stacked(segments, total, width):
             if x < acc:
                 col = c
                 break
-        code = rgb(col or P_TRACK)
+        code = rgb(col or P_SEG)
         if code != last:
             out.append(code)
             last = code
-        out.append("█" if col else "░")
+        out.append("▊")
     return "".join(out) + RESET
 
 
@@ -272,16 +281,18 @@ def human_mem(mb):
 
 
 def panel(title, lines, width, color=P_ACCENT, right=""):
+    """A framed instrument panel: bright corner brackets in the panel's colour, hairline edges."""
     inner = width - 4
+    title = title.upper()
     extra = vlen(right) + 2 if right else 0
-    fill = width - 6 - len(title) - extra
+    fill = width - 7 - len(title) - extra
     if fill < 1:
-        right, fill = "", max(0, width - 6 - len(title))
-    b = rgb(P_BORDER)
-    top = (b + "╭─ " + RESET + BOLD + rgb(color) + title + RESET + b + " " + "─" * fill + RESET
-           + (" " + right + RESET + " " if right else "") + b + "─╮" + RESET)
+        right, fill = "", max(0, width - 7 - len(title))
+    b, a = rgb(P_BORDER), BOLD + rgb(color)
+    top = (a + "┏━ " + title + " " + RESET + b + "╶" + "─" * max(0, fill - 1) + RESET
+           + (" " + right + RESET + " " if right else "") + a + "━┓" + RESET)
     body = [b + "│ " + RESET + fit(l, inner) + b + " │" + RESET for l in lines]
-    return [top] + body + [b + "╰" + "─" * (width - 2) + "╯" + RESET]
+    return [top] + body + [a + "┗" + RESET + b + "─" * (width - 2) + a + "┛" + RESET]
 
 
 def side_by_side(a, b, wa, wb):
@@ -424,6 +435,7 @@ def battery():
     charging = val("IsCharging") == "Yes"
     full = val("FullyCharged") == "Yes"
     amps, volts = num("Amperage"), num("Voltage")
+    mins = num("TimeRemaining")
     tele, adapter = val("PowerTelemetryData"), val("AdapterDetails") or ""
     kilo = lambda v: v / 1000.0 if v is not None else None
     name = re.search(r'"(?:Name|Description)"="([^"]+)"', adapter)
@@ -434,6 +446,7 @@ def battery():
         "temp": t / 100 if t else None,
         "state": "charging" if charging else ("full, plugged in" if full else "plugged in") if plugged else "on battery",
         "plugged": plugged,
+        "mins": mins if mins and 0 < mins < 6000 else None,       # to full when charging, to empty on battery
         # measured by the Mac's own power chip, in watts / volts / amps
         "in_w": kilo(inner("SystemPowerIn", tele)) if plugged else 0.0,
         "in_v": kilo(inner("SystemVoltageIn", tele)) if plugged else 0.0,
@@ -791,6 +804,13 @@ class SMC:
                 out[n] = (struct.unpack("<f", v)[0], struct.unpack("<f", a)[0])
         return out
 
+    def power(self):
+        """Live readings from the Mac's power chip: charger volts / amps / watts, whole-Mac watts, battery °C."""
+        def f(name):
+            b = self._read(int.from_bytes(name.encode(), "big"), 4)
+            return struct.unpack("<f", b)[0] if b else None
+        return {"in_v": f("VD0R"), "in_a": f("ID0R"), "in_w": f("PDTR"), "sys_w": f("PSTR"), "bat_t": f("TB0T")}
+
     def fans(self):
         """Fan speeds in rpm. Empty on a Mac without fans."""
         n = self._read(int.from_bytes(b"FNum", "big"), 1)
@@ -1123,6 +1143,7 @@ class State:
         self.sort = "cpu"
         self.confirm = None
         self.view = "main"
+        self.live = {}          # smoothed live power readings for the ports view
         self.procs = []
         self.last = None
         self.hot = []           # clickable footer buttons: (x0, x1, action)
@@ -1287,7 +1308,47 @@ def port_text(p, pw, bat, chip, sole_charger, devices, out=None):
     return name, lines, flow, col
 
 
-def mac_view(st, s, temps, bat, info, W, H):
+def cv_bar(cv, x, y, frac, width, stops, glow=None):
+    """Segmented meter drawn on a canvas. glow(i) -> 0..1 brightens lit segments (for animation)."""
+    lit = int(round(min(1.0, max(0.0, frac)) * width))
+    for i in range(width):
+        if i < lit:
+            col = grad(stops, i / float(max(1, width - 1)))
+            if glow:
+                col = grad([col, (255, 255, 255)], 0.45 * glow(i))
+            cv.put(x + i, y, "▊", rgb(col))
+        else:
+            cv.put(x + i, y, "▊", rgb(P_SEG))
+
+
+def live_power(st, info, bat):
+    """Battery numbers topped up with the power chip's live sensors, lightly smoothed so digits stay readable."""
+    if not bat:
+        return bat
+    bat = dict(bat)
+    smc = info.get("smc")
+    try:
+        raw = smc.power() if smc else {}
+    except Exception:
+        raw = {}
+    for k, v in raw.items():
+        if v is not None and -1 < v < 400:
+            st.live[k] = v if k not in st.live else st.live[k] + 0.12 * (v - st.live[k])
+    lv = st.live
+    if bat.get("plugged") and lv.get("in_w", 0) > 0.5 and lv.get("in_v", 0) > 3:
+        bat["in_w"], bat["in_v"], bat["in_a"] = lv["in_w"], lv["in_v"], lv.get("in_a") or lv["in_w"] / lv["in_v"]
+    if lv.get("sys_w", 0) > 0.5:
+        bat["load_w"] = lv["sys_w"]
+        if bat.get("plugged") and bat.get("in_w"):
+            bat["bat_w"] = bat["in_w"] - lv["sys_w"] if bat["state"] == "charging" else 0.0
+        elif not bat.get("plugged"):
+            bat["bat_w"] = -lv["sys_w"]
+    if lv.get("bat_t") and not bat.get("temp"):
+        bat["temp"] = lv["bat_t"]
+    return bat
+
+
+def mac_view(st, s, temps, bat, dsk, info, W, H):
     """The Mac seen from above: ports on its sides, the chip in the middle, heat leaving the case."""
     pw = info["ports"]
     now = time.time()
@@ -1297,7 +1358,8 @@ def mac_view(st, s, temps, bat, info, W, H):
     left, right = port_layout(model, pw.ports)
     laptop, fanless = "Book" in model, "Air" in model
     flow_w = 7 if cw >= 96 else 4
-    bw = max(26, min(64, int(cw * 0.40)))
+    bat = live_power(st, info, bat)
+    bw = max(28, min(84, int(cw * 0.46)))
     lw = (cw - bw - 2 * flow_w) // 2
     bx0 = lw + flow_w
     bx1 = bx0 + bw - 1
@@ -1316,47 +1378,129 @@ def mac_view(st, s, temps, bat, info, W, H):
     hottest = temps.get("cpu_max") or t_cpu or 40.0
     heat = min(1.0, max(0.0, (hottest - 35) / 60.0))
     hot = grad(HEAT, heat)
-    cwid = min(bw - 4, 30)
-    cx0 = bx0 + (bw - cwid) // 2
-    cy0 = by0 + 3
-    chip_edge = rgb(grad([hot, (255, 255, 255)], 0.12 + 0.12 * math.sin(now * (2 + 4 * heat))))
-    title = " " + cut(info["chip"], cwid - 6) + " "
-    cv.put(cx0, cy0, "╭─" + title + "─" * (cwid - 3 - len(title)) + "╮", chip_edge)
+    white = (255, 255, 255)
+    ix0, iw = bx0 + 4, bw - 8                      # the space inside the body, clear of the port shapes
+    cwid, cx0, cy0 = iw, ix0, by0 + 3
+    ok = lambda y: y < by1                         # never draw over the bottom edge
+    label = rgb(P_DIM)
+    chip_edge = rgb(grad([hot, white], 0.12 + 0.12 * math.sin(now * (2 + 4 * heat))))
+    title = " " + cut(info["chip"].upper(), cwid - 16) + " "
+    cv.put(cx0, cy0, "╭─" + "─" * (cwid - 3) + "╮", chip_edge)
     cv.put(cx0 + 2, cy0, title, BOLD + chip_edge)
-    cv.put(cx0, cy0 + 3, "╰" + "─" * (cwid - 2) + "╯", chip_edge)
+    if s.get("has_power", True):
+        tag = " %.1f W " % s["total_w"]
+        cv.put(cx0 + cwid - 2 - len(tag), cy0, tag, BOLD + rgb(P_PWR))
     cores = s["e_cores"] + s["p_cores"]
-    for i, (label, col, t, load) in enumerate((("CPU", P_P, t_cpu, sum(cores) / len(cores) if cores else 0.0),
-                                               ("GPU", P_GPU, t_gpu if t_gpu is not None else t_cpu, s["gpu"]))):
-        y = cy0 + 1 + i
+    mw = max(4, cwid - 21)
+    rows_c = (("CPU", P_P, G_P, t_cpu, sum(cores) / len(cores) if cores else 0.0),
+              ("GPU", P_GPU, G_GPU, t_gpu if t_gpu is not None else t_cpu, s["gpu"] or 0.0))
+    for k, (name, col, stops, t, load) in enumerate(rows_c):
+        y = cy0 + 1 + k
         cv.put(cx0, y, "│", chip_edge)
         cv.put(cx0 + cwid - 1, y, "│", chip_edge)
-        cv.put(cx0 + 2, y, label, BOLD + rgb(col))
-        cv.put(cx0 + 7, y, "%3d°C" % t if t is not None else "  n/a", BOLD + rgb(temp_rgb(t or 0)))
-        cv.put(cx0 + 14, y, "%3d%%" % round(100 * (load or 0)), TEXT)
+        cv.put(cx0 + 2, y, name, BOLD + rgb(col))
+        cv_bar(cv, cx0 + 6, y, load, mw, stops)
+        cv.put(cx0 + 7 + mw, y, "%3d%%" % round(100 * load), TEXT)
+        cv.put(cx0 + 12 + mw, y, "%3d°C" % t if t is not None else "  n/a", BOLD + rgb(temp_rgb(t or 0)))
+    y = cy0 + 3
+    cv.put(cx0, y, "│", chip_edge)
+    cv.put(cx0 + cwid - 1, y, "│", chip_edge)
+    cv.put(cx0 + 2, y, "CORES", label)
+    x = cx0 + 8
+    for group, stops in ((s["e_cores"], G_E), (s["p_cores"], G_P)):
+        for c in group:
+            if x < cx0 + cwid - 2:
+                cv.put(x, y, VBAR[max(1, int(round(c * 8)))], rgb(grad(stops, c)))
+            x += 1
+        x += 1
+    cv.put(cx0, cy0 + 4, "╰" + "─" * (cwid - 2) + "╯", chip_edge)
 
-    # ---- power summary inside the body
-    notes = []
-    if bat:
-        notes.append((TEXT, "Battery %d%%  %s" % (bat["pct"], bat["state"])))
-        if bat.get("in_w"):
-            notes.append((BOLD + rgb(P_PWR), "Power in %.1f W  (%.1f V × %.2f A)" % (
-                bat["in_w"], bat.get("in_v") or 0, bat.get("in_a") or 0)))
-        if bat.get("load_w"):
-            notes.append((rgb(P_MUTED), "Whole Mac is using %.1f W" % bat["load_w"]))
-        if bat.get("bat_w") and abs(bat["bat_w"]) > 0.2:
-            notes.append((rgb(P_MUTED), "Battery %s %.1f W" % ("charging at" if bat["bat_w"] > 0 else "giving", abs(bat["bat_w"]))))
+    # ---- fans
+    fans = [f for f in temps.get("fans") or [] if f is not None]
+    if fans and not ("Air" in model):
+        bits = []
+        for k, rpm in enumerate(fans[:2]):
+            spin = "◐◓◑◒"[int(now * min(12.0, rpm / 250.0) + k * 2) % 4] if rpm > 100 else "○"
+            bits.append("FAN %s %s" % (spin, "%d rpm" % rpm if rpm > 100 else "resting"))
+        text = cut("     ".join(bits), max(0, cwid - 10))
+        cv.put(cx0 + (cwid - len(text)) // 2, by0 + 1, text, rgb(grad([P_MUTED, hot], heat)))
+
+    # ---- where the power is going right now
+    y = cy0 + 6
+    def wire(x0, x1, yy, col, speed=1.6):
+        for x in range(x0, x1):
+            f = (0.5 + 0.5 * math.sin(2 * math.pi * (x / 6.0 - now * speed))) ** 3
+            cv.put(x, yy, "━", BOLD + rgb(grad([grad([col, P_BORDER], 0.6), grad([col, white], 0.45)], f)))
+        cv.put(x1, yy, "▶", BOLD + rgb(col))
+
+    load_w = (bat or {}).get("load_w")
+    if ok(y + 2):
+        cv.put(ix0, y, "POWER FLOW", label)
+        y += 1
+        if bat and bat.get("plugged") and bat.get("in_w"):
+            src = "CHARGER %.1f W" % bat["in_w"]
+            cv.put(ix0, y, src, BOLD + rgb(P_PWR))
+            dst = "MAC %.1f W" % load_w if load_w else "MAC"
+            cv.put(ix0 + iw - len(dst), y, dst, TEXT)
+            wire(ix0 + len(src) + 1, ix0 + iw - len(dst) - 2, y, P_PWR)
+            bw_ = bat.get("bat_w") or 0.0
+            if bw_ > 0.3 and ok(y + 1):
+                dst = "BATTERY +%.1f W" % bw_
+                cv.put(ix0 + iw - len(dst), y + 1, dst, BOLD + rgb(P_RAM))
+                cv.put(ix0 + len(src) + 3, y + 1, "┗", BOLD + rgb(P_RAM))
+                wire(ix0 + len(src) + 4, ix0 + iw - len(dst) - 2, y + 1, P_RAM, 1.1)
+                y += 1
+        elif bat:
+            src = "BATTERY %.1f W" % abs(bat.get("bat_w") or load_w or 0)
+            cv.put(ix0, y, src, BOLD + rgb(P_RAM))
+            dst = "MAC %.1f W" % load_w if load_w else "MAC"
+            cv.put(ix0 + iw - len(dst), y, dst, TEXT)
+            wire(ix0 + len(src) + 1, ix0 + iw - len(dst) - 2, y, P_RAM)
+        else:
+            cv.put(ix0, y, "WALL POWER", BOLD + rgb(P_PWR))
+            wire(ix0 + 11, ix0 + iw - 5, y, P_PWR)
+            cv.put(ix0 + iw - 3, y, "MAC", TEXT)
+        y += 2
+
+    # ---- battery
+    if bat and ok(y + 3):
+        lvl = bat["pct"] / 100.0
+        b_col = GOOD if bat["pct"] > 40 else WARN if bat["pct"] > 20 else BAD
+        cv.put(ix0, y, "BATTERY", label)
+        head = "%d%%  %s" % (bat["pct"], bat["state"])
+        if bat.get("mins") and bat["state"] in ("charging", "on battery"):
+            head += "  ·  %s in %d:%02d" % ("full" if bat["state"] == "charging" else "empty",
+                                            bat["mins"] // 60, bat["mins"] % 60)
+        cv.put(ix0 + 9, y, cut(head, iw - 9), TEXT)
+        charging = bat["state"] == "charging"
+        glow = (lambda i: (0.5 + 0.5 * math.sin(2 * math.pi * (i / 9.0 - now * 0.9))) ** 2) if charging else None
+        for r in (1, 2):
+            cv_bar(cv, ix0, y + r, lvl, iw - 2, [b_col, grad([b_col, white], 0.25)], glow)
+            cv.put(ix0 + iw - 2, y + r, "▌", rgb(P_BORDER))
+        bits = []
+        if bat.get("health"):
+            bits.append("health %d%%" % bat["health"])
+        bits.append("%d cycles" % bat["cycles"])
+        if bat.get("temp"):
+            bits.append("%d°C" % bat["temp"])
         if bat.get("adapter_w"):
-            notes.append((rgb(P_MUTED), "Charger: %d W %s" % (bat["adapter_w"], bat.get("adapter_name") or "")))
-    else:
-        notes.append((rgb(P_MUTED), "No battery: runs from the wall"))
-    if s.get("has_power", True):
-        notes.append((rgb(P_MUTED), "Chip alone is using %.1f W" % s["total_w"]))
-    for i, (style, text) in enumerate(notes):
-        y = cy0 + 5 + i
-        if y >= by1:
-            break
-        text = cut(text.strip(), bw - 4)
-        cv.put(bx0 + (bw - len(text)) // 2, y, text, style)
+            bits.append("charger %d W" % bat["adapter_w"])
+        if ok(y + 3):
+            cv.put(ix0, y + 3, cut("  ·  ".join(bits), iw), rgb(P_MUTED))
+        y += 5
+
+    # ---- built-in SSD
+    d_used, d_total, d_free = dsk
+    if d_total and ok(y + 1):
+        cv.put(ix0, y, "STORAGE", label)
+        txt = "%d%%  ·  %.0f GB free of %.0f" % (round(100 * d_used / d_total), d_free, d_total)
+        cv.put(ix0 + 9, y, cut(txt, iw - 9), TEXT)
+        cv_bar(cv, ix0, y + 1, d_used / d_total, iw, G_DSK)
+        if ok(y + 2):
+            io = "read %s  ·  write %s" % (human_rate(s["disk_r"]), human_rate(s["disk_w"]))
+            if temps.get("ssd") is not None:
+                io += "  ·  %d°C" % temps["ssd"]
+            cv.put(ix0, y + 2, cut(io, iw), rgb(P_MUTED))
 
     # ---- heat: red worms crawl from the chip to where the heat leaves the case
     speed, count = 5 + 16 * heat, 1 + int(heat * 3)
@@ -1373,10 +1517,6 @@ def mac_view(st, s, temps, bat, info, W, H):
         paths = [[(xl, y, "┃") for y in range(cy0 - 1, by0, -1)] + [(x, by0, "━") for x in range(xl, bx0, -1)],
                  [(xr, y, "┃") for y in range(cy0 - 1, by0, -1)] + [(x, by0, "━") for x in range(xr, bx1)]]
         msg = "▲ hot air leaves at the back" + (" (hinge vents)" if laptop else "")
-        fans = [f for f in temps.get("fans") or [] if f is not None]
-        if fans:
-            rpm = max(fans)
-            msg += "  ·  fans %d rpm" % rpm if rpm > 100 else "  ·  fans resting"
         for x in range(bx0 + 2, bx1 - 1, 3):      # air shimmering off the back edge
             f = 0.5 + 0.5 * math.sin(now * (2 + 5 * heat) + x * 1.7)
             cv.put(x, by0 - 1, "˙" if f > 0.66 else "·" if f > 0.33 else ".", rgb(grad([P_BORDER, hot], 0.25 + 0.75 * f)))
@@ -1488,10 +1628,11 @@ def render(st, s, mem, pressure, temps, dsk, bat, info, cols, rows):
     body_lines = 5 + 2 * h
 
     # ---- header
-    logo = BOLD + rgb(G_LOGO[0]) + "◆ " + "".join(rgb(grad(G_LOGO, i / 3.0)) + ch for i, ch in enumerate("mtop")) + RESET
-    left = " " + logo + "  " + TEXT + info["chip"] + RESET
-    left_full = left + (muted("  " + info["cores"]) if info["cores"] else "")
-    sep = dim("  ·  ")
+    logo = BOLD + rgb(G_LOGO[0]) + "◆ " + "".join(rgb(grad(G_LOGO, i / 3.0)) + ch for i, ch in enumerate("MTOP")) + RESET
+    slash = rgb(P_BORDER) + " ╱ " + RESET
+    left = " " + logo + slash + TEXT + info["chip"].upper() + RESET
+    left_full = left + (slash + muted(info["cores"]) if info["cores"] else "")
+    sep = rgb(P_BORDER) + " ╱ " + RESET
     th = s["thermal"]
     bits = []
     if temps.get("cpu") is not None:
@@ -1522,7 +1663,7 @@ def render(st, s, mem, pressure, temps, dsk, bat, info, cols, rows):
             rgb(grad(G_LOAD, c)) + VBAR[max(1, int(round(c * 8)))] * wide for c in cs) + RESET
 
     if st.view == "mac":
-        body = mac_view(st, s, temps, bat, info, W, max(13, min(36, rows - len(head) - fixed + 1 - 2)))
+        body = mac_view(st, s, temps, bat, dsk, info, W, max(13, min(36, rows - len(head) - fixed + 1 - 2)))
         st.rows_hit = (0, 0, 0, 0)
     else:
         # ---- row 1: CPU | GPU & Memory
@@ -1894,10 +2035,11 @@ def main():
     if tty:
         sys.stdout.write("\x1b[?1000h\x1b[?1006h")           # report mouse clicks
     frames = 0
+    shown, shown_size = [], None
     try:
         while True:
             fds = [sys.stdin] if tty else []
-            anim = 0.05 if st.view == "mac" and st.last else None      # the ports view is animated
+            anim = 0.066 if st.view == "mac" and st.last else None      # the ports view is animated
             if src:
                 r, _, _ = select.select(fds + [src.fd], [], [], anim)
             else:
@@ -1934,7 +2076,7 @@ def main():
                 if a.demo:
                     mem, pressure, temps = (14.4 + math.sin(demo.t / 3), 24.0, 0.0, 0.0, 6.2, 2.1, 0.8), "normal", demo.temps()
                     st.procs = demo.procs()
-                    bat = {"pct": 87, "health": 94, "cycles": 143, "temp": 31.0, "state": "charging", "plugged": True,
+                    bat = {"pct": 87, "health": 94, "cycles": 143, "temp": 31.0, "state": "charging", "plugged": True, "mins": 48,
                            "in_w": 58 + 6 * math.sin(demo.t / 2), "in_v": 20.1, "in_a": (58 + 6 * math.sin(demo.t / 2)) / 20.1,
                            "load_w": 30 + 6 * math.sin(demo.t / 2), "bat_w": 28.0, "adapter_w": 96,
                            "adapter_name": "pd charger"}
@@ -1963,9 +2105,17 @@ def main():
             s_, mem_, pressure_, temps_ = st.last
             size = shutil.get_terminal_size((120, 40))
             lines = render(st, s_, mem_, pressure_, temps_, dsk, bat, info, size.columns, size.lines)
-            # synchronized update: the terminal paints the whole frame at once, no flicker
-            sys.stdout.write("\x1b[?2026h\x1b[H" + "\x1b[K\n".join(lines) + "\x1b[K\x1b[J\x1b[?2026l")
-            sys.stdout.flush()
+            # only the lines that changed are sent, inside a synchronized update: less work for the
+            # terminal app, so it uses less CPU and memory, and the frame still appears all at once
+            if (size.columns, size.lines) != shown_size or len(lines) != len(shown):
+                shown, shown_size = [], (size.columns, size.lines)
+                sys.stdout.write("\x1b[2J")
+            out = ["\x1b[%d;1H%s\x1b[K" % (i + 1, l) for i, l in enumerate(lines)
+                   if i >= len(shown) or shown[i] != l]
+            shown = lines
+            if out:
+                sys.stdout.write("\x1b[?2026h" + "".join(out) + "\x1b[?2026l")
+                sys.stdout.flush()
             frames += 1
             if a.frames and frames >= a.frames:
                 break
